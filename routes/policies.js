@@ -14,6 +14,9 @@ router.post("/", requireAuth, async (req, res) => {
       bluetooth_blocked,
       wifi_restricted,
       usb_transfer_blocked,
+      kiosk_mode,
+      working_hours_start,
+      working_hours_end,
     } = req.body;
 
     if (!name) {
@@ -21,14 +24,17 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked, kiosk_mode, working_hours_start, working_hours_end)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         name,
         !!camera_blocked,
         !!bluetooth_blocked,
         !!wifi_restricted,
         !!usb_transfer_blocked,
+        !!kiosk_mode,
+        working_hours_start || null,
+        working_hours_end || null,
       ]
     );
 
@@ -102,6 +108,7 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     if (policy.bluetooth_blocked) commandsToSend.push("block_bluetooth");
     if (policy.wifi_restricted) commandsToSend.push("block_wifi");
     if (policy.usb_transfer_blocked) commandsToSend.push("block_usb");
+    if (policy.kiosk_mode) commandsToSend.push("enable_kiosk");
 
     for (const cmd of commandsToSend) {
       await sendCommandToDevice(device, cmd, req.user.id);
