@@ -72,13 +72,31 @@ router.get("/", requireAuth, async (req, res) => {
 router.patch("/:device_uid/heartbeat", async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const { battery_level, fcm_token } = req.body;
+    const {
+      battery_level,
+      fcm_token,
+      manufacturer,
+      device_identifier,
+      ram_gb,
+      storage_total_gb,
+      storage_used_gb,
+      network_info,
+    } = req.body;
 
     const result = await pool.query(
       `UPDATE devices
-       SET status = 'online', battery_level = $1, fcm_token = COALESCE($2, fcm_token), last_seen = NOW()
-       WHERE device_uid = $3 RETURNING *`,
-      [battery_level, fcm_token, device_uid]
+       SET status = 'online',
+           battery_level = $1,
+           fcm_token = COALESCE($2, fcm_token),
+           manufacturer = COALESCE($3, manufacturer),
+           device_identifier = COALESCE($4, device_identifier),
+           ram_gb = COALESCE($5, ram_gb),
+           storage_total_gb = COALESCE($6, storage_total_gb),
+           storage_used_gb = COALESCE($7, storage_used_gb),
+           network_info = COALESCE($8, network_info),
+           last_seen = NOW()
+       WHERE device_uid = $9 RETURNING *`,
+      [battery_level, fcm_token, manufacturer, device_identifier, ram_gb, storage_total_gb, storage_used_gb, network_info, device_uid]
     );
 
     if (result.rows.length === 0) {
