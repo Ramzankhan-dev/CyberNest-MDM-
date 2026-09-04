@@ -77,6 +77,7 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
       fcm_token,
       manufacturer,
       device_identifier,
+      imei,
       ram_gb,
       storage_total_gb,
       storage_used_gb,
@@ -90,13 +91,14 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
            fcm_token = COALESCE($2, fcm_token),
            manufacturer = COALESCE($3, manufacturer),
            device_identifier = COALESCE($4, device_identifier),
-           ram_gb = COALESCE($5, ram_gb),
-           storage_total_gb = COALESCE($6, storage_total_gb),
-           storage_used_gb = COALESCE($7, storage_used_gb),
-           network_info = COALESCE($8, network_info),
+           imei = COALESCE($5, imei),
+           ram_gb = COALESCE($6, ram_gb),
+           storage_total_gb = COALESCE($7, storage_total_gb),
+           storage_used_gb = COALESCE($8, storage_used_gb),
+           network_info = COALESCE($9, network_info),
            last_seen = NOW()
-       WHERE device_uid = $9 RETURNING *`,
-      [battery_level, fcm_token, manufacturer, device_identifier, ram_gb, storage_total_gb, storage_used_gb, network_info, device_uid]
+       WHERE device_uid = $10 RETURNING *`,
+      [battery_level, fcm_token, manufacturer, device_identifier, imei, ram_gb, storage_total_gb, storage_used_gb, network_info, device_uid]
     );
 
     if (result.rows.length === 0) {
