@@ -92,4 +92,30 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
   }
 });
 
+// GET /api/devices/:device_uid/current-policy   (Called by the Android agent)
+// Returns the most recently assigned policy's flags, so the device can
+// re-apply everything when it receives a "refresh_policy" command.
+router.get("/:device_uid/current-policy", async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const result = await pool.query(
+      `SELECT p.* FROM device_policies dp
+       JOIN devices d ON dp.device_id = d.id
+       JOIN policies p ON dp.policy_id = p.id
+       WHERE d.device_uid = $1
+       ORDER BY dp.assigned_at DESC LIMIT 1`,
+      [device_uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ policy: null });
+    }
+
+    res.json({ policy: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
