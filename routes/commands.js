@@ -11,7 +11,7 @@ const router = express.Router();
 // and logs the command in the database.
 router.post("/send", requireAuth, async (req, res) => {
   try {
-    const { device_uid, command_type } = req.body;
+    const { device_uid, command_type, package_name } = req.body;
     if (!device_uid || !command_type) {
       return res.status(400).json({ error: "device_uid and command_type are required" });
     }
@@ -33,18 +33,23 @@ router.post("/send", requireAuth, async (req, res) => {
     const commandLog = await pool.query(
       `INSERT INTO commands (device_id, command_type, issued_by, status)
        VALUES ($1, $2, $3, 'pending') RETURNING *`,
-      [device.id, command_type, req.user.id]
+      [device.id, package_name ? `${command_type}:${package_name}` : command_type, req.user.id]
     );
 
     // Send the actual push message via Firebase Cloud Messaging.
     // Data-only message (no "notification" field) so it's delivered
     // silently to the app's background service, not shown as a popup.
+    const messageData = {
+      command: command_type,
+      command_id: String(commandLog.rows[0].id),
+    };
+    if (package_name) {
+      messageData.package_name = package_name;
+    }
+
     const message = {
       token: device.fcm_token,
-      data: {
-        command: command_type,
-        command_id: String(commandLog.rows[0].id),
-      },
+      data: messageData,
     };
 
     await admin.messaging().send(message);
