@@ -15,6 +15,7 @@ router.post("/", requireAuth, async (req, res) => {
       wifi_restricted,
       usb_transfer_blocked,
       kiosk_mode,
+      kiosk_package,
       working_hours_start,
       working_hours_end,
     } = req.body;
@@ -24,8 +25,8 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked, kiosk_mode, working_hours_start, working_hours_end)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked, kiosk_mode, kiosk_package, working_hours_start, working_hours_end)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [
         name,
         !!camera_blocked,
@@ -33,6 +34,7 @@ router.post("/", requireAuth, async (req, res) => {
         !!wifi_restricted,
         !!usb_transfer_blocked,
         !!kiosk_mode,
+        kiosk_package || null,
         working_hours_start || null,
         working_hours_end || null,
       ]
@@ -58,19 +60,22 @@ router.get("/", requireAuth, async (req, res) => {
 
 // Sends one command to a device via FCM and logs it — shared helper
 // so applying a policy can fire off several commands in one go.
-async function sendCommandToDevice(device, commandType, issuedBy) {
+async function sendCommandToDevice(device, commandType, issuedBy, packageName = null) {
   const commandLog = await pool.query(
     `INSERT INTO commands (device_id, command_type, issued_by, status)
      VALUES ($1, $2, $3, 'pending') RETURNING *`,
     [device.id, commandType, issuedBy]
   );
 
+  const messageData = {
+    command: commandType,
+    command_id: String(commandLog.rows[0].id),
+  };
+  if (packageName) messageData.package_name = packageName;
+
   await admin.messaging().send({
     token: device.fcm_token,
-    data: {
-      command: commandType,
-      command_id: String(commandLog.rows[0].id),
-    },
+    data: messageData,
   });
 
   await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
@@ -111,7 +116,8 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     if (policy.kiosk_mode) commandsToSend.push("enable_kiosk");
 
     for (const cmd of commandsToSend) {
-      await sendCommandToDevice(device, cmd, req.user.id);
+      const pkg = cmd === "enable_kiosk" ? policy.kiosk_package : null;
+      await sendCommandToDevice(device, cmd, req.user.id, pkg);
     }
 
     // Remember this assignment for the record
