@@ -146,6 +146,17 @@ router.post("/:device_uid/apps", async (req, res) => {
       );
     }
 
+    // The device's report is the source of truth for what's currently
+    // installed — remove any stored app that's no longer in this list
+    // (e.g. it was uninstalled since the last report).
+    const currentPackageNames = apps.map((a) => a.package_name);
+    if (currentPackageNames.length > 0) {
+      await pool.query(
+        `DELETE FROM device_apps WHERE device_id = $1 AND package_name != ALL($2::text[])`,
+        [device.id, currentPackageNames]
+      );
+    }
+
     res.json({ message: "App list updated", count: apps.length });
   } catch (err) {
     console.error(err);
