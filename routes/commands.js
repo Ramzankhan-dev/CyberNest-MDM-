@@ -33,7 +33,7 @@ router.post("/send", requireAuth, async (req, res) => {
     const commandLog = await pool.query(
       `INSERT INTO commands (device_id, command_type, issued_by, status)
        VALUES ($1, $2, $3, 'pending') RETURNING *`,
-      [device.id, package_name ? `${command_type}:${package_name}` : command_type, req.user.id]
+      [device.id, command_type, req.user.id]
     );
 
     // Send the actual push message via Firebase Cloud Messaging.
