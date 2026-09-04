@@ -118,4 +118,77 @@ router.get("/:device_uid/current-policy", async (req, res) => {
   }
 });
 
+// POST /api/devices/:device_uid/apps   (Called by the Android agent)
+// Body: { apps: [{ package_name, app_name }, ...] }
+// Device reports its installed apps here whenever it receives a
+// "list_apps" command. We upsert so re-runs just refresh the list.
+router.post("/:device_uid/apps", async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const { apps } = req.body;
+    if (!Array.isArray(apps)) {
+      return res.status(400).json({ error: "apps must be an array" });
+    }
+
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    for (const app of apps) {
+      await pool.query(
+        `INSERT INTO device_apps (device_id, package_name, app_name)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (device_id, package_name)
+         DO UPDATE SET app_name = EXCLUDED.app_name, updated_at = NOW()`,
+        [device.id, app.package_name, app.app_name || null]
+      );
+    }
+
+    res.json({ message: "App list updated", count: apps.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/devices/:device_uid/apps   (Admin only)
+router.get("/:device_uid/apps", requireAuth, async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const result = await pool.query(
+      `SELECT da.* FROM device_apps da
+       JOIN devices d ON da.device_id = d.id
+       WHERE d.device_uid = $1
+       ORDER BY da.app_name ASC`,
+      [device_uid]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /api/devices/:device_uid/apps/:package_name/status   (Called by the Android agent)
+// Keeps the stored status in sync after a block/unblock command runs.
+router.patch("/:device_uid/apps/:package_name/status", async (req, res) => {
+  try {
+    const { device_uid, package_name } = req.params;
+    const { status } = req.body;
+
+    await pool.query(
+      `UPDATE device_apps SET status = $1, updated_at = NOW()
+       WHERE package_name = $2 AND device_id = (SELECT id FROM devices WHERE device_uid = $3)`,
+      [status, package_name, device_uid]
+    );
+
+    res.json({ message: "Status updated" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
