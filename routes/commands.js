@@ -87,6 +87,25 @@ router.post("/:id/ack", async (req, res) => {
   }
 });
 
+// GET /api/commands   (Admin only) — unified activity log across ALL devices
+router.get("/", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.id, c.command_type, c.status, c.issued_at, c.executed_at,
+              d.device_uid, d.employee_name, u.name AS admin_name
+       FROM commands c
+       JOIN devices d ON c.device_id = d.id
+       LEFT JOIN users u ON c.issued_by = u.id
+       ORDER BY c.issued_at DESC
+       LIMIT 200`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // GET /api/commands/:device_uid   (Admin only) — command history for one device
 router.get("/:device_uid", requireAuth, async (req, res) => {
   try {
