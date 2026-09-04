@@ -82,6 +82,7 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
       storage_total_gb,
       storage_used_gb,
       network_info,
+      is_rooted,
     } = req.body;
 
     const result = await pool.query(
@@ -96,9 +97,10 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
            storage_total_gb = COALESCE($7, storage_total_gb),
            storage_used_gb = COALESCE($8, storage_used_gb),
            network_info = COALESCE($9, network_info),
+           is_rooted = COALESCE($10, is_rooted),
            last_seen = NOW()
-       WHERE device_uid = $10 RETURNING *`,
-      [battery_level, fcm_token, manufacturer, device_identifier, imei, ram_gb, storage_total_gb, storage_used_gb, network_info, device_uid]
+       WHERE device_uid = $11 RETURNING *`,
+      [battery_level, fcm_token, manufacturer, device_identifier, imei, ram_gb, storage_total_gb, storage_used_gb, network_info, is_rooted, device_uid]
     );
 
     if (result.rows.length === 0) {

@@ -1,0 +1,2 @@
+-- Run in Supabase SQL Editor
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_rooted BOOLEAN DEFAULT FALSE;
