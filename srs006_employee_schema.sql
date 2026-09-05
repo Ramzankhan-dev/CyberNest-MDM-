@@ -1,0 +1,5 @@
+-- Run in Supabase SQL Editor — SRS-006 Employee Management
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS email VARCHAR(150);
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS phone_number VARCHAR(30);
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS designation VARCHAR(100);
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'Employee';
