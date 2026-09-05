@@ -1,29 +1,36 @@
 require("dotenv").config();
 
-// Uses Resend's HTTPS API — same reasoning as before (Render blocks raw
-// SMTP). No extra npm package needed, Node 18+ has fetch() built in.
+// Uses EmailJS's HTTPS API — connects to YOUR OWN Gmail account (via
+// OAuth in the EmailJS dashboard), so there's no domain-verification
+// requirement and no sandbox restriction on which recipients you can
+// email. No extra npm package needed (Node 18+ has fetch() built in).
 //
-// Setup: create a free Resend account (resend.com), get your API key
-// from the dashboard (no domain verification needed to send to your
-// OWN signup email in sandbox mode — good enough for a demo).
+// Setup at emailjs.com:
+// 1. Add an Email Service (Email Services > Add New > Gmail > connect
+//    your Google account)
+// 2. Create an Email Template (Email Templates > Create New) with
+//    variables {{to_email}} and {{otp}} used in the template body
+// 3. Get: Service ID, Template ID, Public Key (Account > General),
+//    Private Key (Account > Security — needed for server-side calls)
 async function sendOtpEmail(toEmail, otp) {
-  const response = await fetch("https://api.resend.com/emails", {
+  const response = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      from: process.env.RESEND_FROM_EMAIL || "CyberNest <onboarding@resend.dev>",
-      to: [toEmail],
-      subject: "Your CyberNest password reset code",
-      html: `<p>Your verification code is:</p><h2 style="letter-spacing:4px">${otp}</h2><p>This code expires in 5 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+      service_id: process.env.EMAILJS_SERVICE_ID,
+      template_id: process.env.EMAILJS_TEMPLATE_ID,
+      user_id: process.env.EMAILJS_PUBLIC_KEY,
+      accessToken: process.env.EMAILJS_PRIVATE_KEY,
+      template_params: {
+        to_email: toEmail,
+        otp: otp,
+      },
     }),
   });
 
   if (!response.ok) {
     const errorBody = await response.text();
-    throw new Error(`Resend email send failed: ${response.status} ${errorBody}`);
+    throw new Error(`EmailJS send failed: ${response.status} ${errorBody}`);
   }
 }
 
