@@ -15,9 +15,9 @@ router.post("/generate-token", requireAuth, async (req, res) => {
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
 
     const result = await pool.query(
-      `INSERT INTO devices (device_uid, employee_name, status)
-       VALUES ($1, $2, 'pending') RETURNING *`,
-      [device_uid, employee_name || null]
+      `INSERT INTO devices (device_uid, employee_name, status, organization_id)
+       VALUES ($1, $2, 'pending', $3) RETURNING *`,
+      [device_uid, employee_name || null, req.user.organization_id]
     );
 
     res.status(201).json({ message: "Enrollment token generated", device: result.rows[0] });
@@ -59,7 +59,10 @@ router.post("/confirm", async (req, res) => {
 // GET /api/devices   (Admin only) — list all devices for the dashboard
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM devices ORDER BY enrolled_at DESC");
+    const result = await pool.query(
+      "SELECT * FROM devices WHERE organization_id = $1 ORDER BY enrolled_at DESC",
+      [req.user.organization_id]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -193,9 +196,9 @@ router.get("/:device_uid/apps", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT da.* FROM device_apps da
        JOIN devices d ON da.device_id = d.id
-       WHERE d.device_uid = $1
+       WHERE d.device_uid = $1 AND d.organization_id = $2
        ORDER BY da.app_name ASC`,
-      [device_uid]
+      [device_uid, req.user.organization_id]
     );
     res.json(result.rows);
   } catch (err) {

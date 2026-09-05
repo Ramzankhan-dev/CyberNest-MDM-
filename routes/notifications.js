@@ -17,11 +17,14 @@ router.post("/send", requireAuth, async (req, res) => {
     let devicesResult;
     if (target_device_uid) {
       devicesResult = await pool.query(
-        "SELECT * FROM devices WHERE device_uid = $1 AND fcm_token IS NOT NULL",
-        [target_device_uid]
+        "SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2 AND fcm_token IS NOT NULL",
+        [target_device_uid, req.user.organization_id]
       );
     } else {
-      devicesResult = await pool.query("SELECT * FROM devices WHERE fcm_token IS NOT NULL");
+      devicesResult = await pool.query(
+        "SELECT * FROM devices WHERE organization_id = $1 AND fcm_token IS NOT NULL",
+        [req.user.organization_id]
+      );
     }
 
     const devices = devicesResult.rows;
@@ -43,9 +46,9 @@ router.post("/send", requireAuth, async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO notifications (message, target_device_uid, sent_by, device_count)
-       VALUES ($1, $2, $3, $4)`,
-      [message.trim(), target_device_uid || null, req.user.id, sentCount]
+      `INSERT INTO notifications (message, target_device_uid, sent_by, device_count, organization_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [message.trim(), target_device_uid || null, req.user.id, sentCount, req.user.organization_id]
     );
 
     res.json({ message: "Notification sent", sent_to: sentCount });
@@ -59,7 +62,8 @@ router.post("/send", requireAuth, async (req, res) => {
 router.get("/", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM notifications ORDER BY sent_at DESC LIMIT 50"
+      "SELECT * FROM notifications WHERE organization_id = $1 ORDER BY sent_at DESC LIMIT 50",
+      [req.user.organization_id]
     );
     res.json(result.rows);
   } catch (err) {

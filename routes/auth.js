@@ -7,12 +7,12 @@ const requireAuth = require("../middleware/auth");
 
 const router = express.Router();
 
-// POST /api/auth/register  -> create an admin account (use once to create your first admin)
+// POST /api/auth/register  -> creates a new organization + its first admin
 router.post("/register", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: "name, email and password are required" });
+    const { name, email, password, organization_name } = req.body;
+    if (!name || !email || !password || !organization_name) {
+      return res.status(400).json({ error: "name, email, password and organization_name are required" });
     }
 
     const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
@@ -20,13 +20,21 @@ router.post("/register", async (req, res) => {
       return res.status(409).json({ error: "Email already registered" });
     }
 
+    // Every admin who signs up gets their own organization — their data
+    // is scoped to it from here on, and they never see other orgs' data.
+    const orgResult = await pool.query(
+      "INSERT INTO organizations (name) VALUES ($1) RETURNING id",
+      [organization_name]
+    );
+    const organizationId = orgResult.rows[0].id;
+
     const password_hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email",
-      [name, email, password_hash]
+      "INSERT INTO users (name, email, password_hash, organization_id, role) VALUES ($1, $2, $3, $4, 'super_admin') RETURNING id, name, email, organization_id",
+      [name, email, password_hash, organizationId]
     );
 
-    res.status(201).json({ message: "Admin created", user: result.rows[0] });
+    res.status(201).json({ message: "Admin and organization created", user: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -53,7 +61,7 @@ router.post("/login", async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: user.id, email: user.email, role: user.role, organization_id: user.organization_id },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
@@ -61,7 +69,7 @@ router.post("/login", async (req, res) => {
     res.json({
       message: "Login successful",
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id: user.id, name: user.name, email: user.email, role: user.role, organization_id: user.organization_id },
     });
   } catch (err) {
     console.error(err);

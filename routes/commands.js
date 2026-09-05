@@ -17,8 +17,8 @@ router.post("/send", requireAuth, async (req, res) => {
     }
 
     const deviceResult = await pool.query(
-      "SELECT * FROM devices WHERE device_uid = $1",
-      [device_uid]
+      "SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2",
+      [device_uid, req.user.organization_id]
     );
     const device = deviceResult.rows[0];
 
@@ -96,8 +96,10 @@ router.get("/", requireAuth, async (req, res) => {
        FROM commands c
        JOIN devices d ON c.device_id = d.id
        LEFT JOIN users u ON c.issued_by = u.id
+       WHERE d.organization_id = $1
        ORDER BY c.issued_at DESC
-       LIMIT 200`
+       LIMIT 200`,
+      [req.user.organization_id]
     );
     res.json(result.rows);
   } catch (err) {
@@ -113,9 +115,9 @@ router.get("/:device_uid", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT c.* FROM commands c
        JOIN devices d ON c.device_id = d.id
-       WHERE d.device_uid = $1
+       WHERE d.device_uid = $1 AND d.organization_id = $2
        ORDER BY c.issued_at DESC`,
-      [device_uid]
+      [device_uid, req.user.organization_id]
     );
     res.json(result.rows);
   } catch (err) {

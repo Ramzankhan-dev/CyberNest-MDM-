@@ -25,8 +25,8 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked, kiosk_mode, kiosk_package, working_hours_start, working_hours_end)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      `INSERT INTO policies (name, camera_blocked, bluetooth_blocked, wifi_restricted, usb_transfer_blocked, kiosk_mode, kiosk_package, working_hours_start, working_hours_end, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
       [
         name,
         !!camera_blocked,
@@ -37,6 +37,7 @@ router.post("/", requireAuth, async (req, res) => {
         kiosk_package || null,
         working_hours_start || null,
         working_hours_end || null,
+        req.user.organization_id,
       ]
     );
 
@@ -50,7 +51,10 @@ router.post("/", requireAuth, async (req, res) => {
 // GET /api/policies   (Admin only) — list all saved policy templates
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM policies ORDER BY created_at DESC");
+    const result = await pool.query(
+      "SELECT * FROM policies WHERE organization_id = $1 ORDER BY created_at DESC",
+      [req.user.organization_id]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -93,13 +97,19 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "device_uid is required" });
     }
 
-    const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
+    const policyResult = await pool.query(
+      "SELECT * FROM policies WHERE id = $1 AND organization_id = $2",
+      [id, req.user.organization_id]
+    );
     const policy = policyResult.rows[0];
     if (!policy) {
       return res.status(404).json({ error: "Policy not found" });
     }
 
-    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1", [device_uid]);
+    const deviceResult = await pool.query(
+      "SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2",
+      [device_uid, req.user.organization_id]
+    );
     const device = deviceResult.rows[0];
     if (!device) {
       return res.status(404).json({ error: "Device not found" });
