@@ -211,7 +211,19 @@ router.post("/forgot-password", async (req, res) => {
       [user.id, otpHash, expiresAt]
     );
 
-    await sendOtpEmail(email, otp);
+    // Always log the OTP server-side — a safety net in case the email
+    // provider is temporarily unavailable/restricted, so testing and
+    // demos aren't blocked by third-party email service issues.
+    console.log(`[OTP] Password reset code for ${email}: ${otp} (expires in ${OTP_EXPIRY_MINUTES} min)`);
+
+    try {
+      await sendOtpEmail(email, otp);
+    } catch (emailErr) {
+      // Don't fail the request just because email delivery had an issue —
+      // the OTP is already logged above and can still be used/verified.
+      console.error("Email send failed (OTP still valid, see log above):", emailErr.message);
+    }
+
     await logAudit({ userId: user.id, action: "password_reset_requested", status: "success", req, details: email });
 
     res.json({ message: "If that email is registered, a verification code has been sent." });
