@@ -7,12 +7,17 @@ const router = express.Router();
 
 const ALLOWED_ROLES = ["OrganizationAdmin", "DepartmentManager", "Employee"];
 
-async function departmentBelongsToOrg(departmentId, organizationId) {
-  const result = await pool.query(
-    "SELECT id, status FROM departments WHERE id = $1 AND organization_id = $2",
-    [departmentId, organizationId]
-  );
+async function getDepartmentAnyOrg(departmentId) {
+  const result = await pool.query("SELECT id, status, organization_id FROM departments WHERE id = $1", [departmentId]);
   return result.rows[0] || null;
+}
+
+async function getEmployeeOrgId(employeeId) {
+  const result = await pool.query(
+    `SELECT d.organization_id FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1`,
+    [employeeId]
+  );
+  return result.rows[0]?.organization_id || null;
 }
 
 // POST /api/employees   (SRS-006)
@@ -32,9 +37,16 @@ router.post("/", requireAuth, async (req, res) => {
     if (!department_id) {
       return res.status(400).json({ error: "Department is required" });
     }
-    const dept = await departmentBelongsToOrg(department_id, req.user.organization_id);
+    const dept = await getDepartmentAnyOrg(department_id);
     if (!dept) return res.status(400).json({ error: "Department not found" });
+    // A regular admin can only add employees to their OWN organization's
+    // departments; a Super Admin may add to any organization's department.
+    if (!req.user.is_super_admin && dept.organization_id !== req.user.organization_id) {
+      return res.status(400).json({ error: "Department not found" });
+    }
     if (dept.status !== "active") return res.status(400).json({ error: "Department is not active" });
+
+    const orgId = dept.organization_id;
 
     if (role && !ALLOWED_ROLES.includes(role)) {
       return res.status(400).json({ error: "Role must be OrganizationAdmin, DepartmentManager, or Employee" });
@@ -44,14 +56,14 @@ router.post("/", requireAuth, async (req, res) => {
     const dupCode = await pool.query(
       `SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id
        WHERE d.organization_id = $1 AND e.employee_code = $2`,
-      [req.user.organization_id, employee_code]
+      [orgId, employee_code]
     );
     if (dupCode.rows.length > 0) return res.status(409).json({ error: "Employee ID already exists" });
 
     const dupEmail = await pool.query(
       `SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id
        WHERE d.organization_id = $1 AND e.email = $2`,
-      [req.user.organization_id, email]
+      [orgId, email]
     );
     if (dupEmail.rows.length > 0) return res.status(409).json({ error: "Email already exists" });
 
@@ -62,7 +74,7 @@ router.post("/", requireAuth, async (req, res) => {
       [department_id, fullName, employee_code, email, phone_number || null, designation || null, role || "Employee", status || "active"]
     );
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_created", status: "success", req, details: fullName });
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "employee_created", status: "success", req, details: fullName });
     res.status(201).json({ message: "Employee added", employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -73,9 +85,15 @@ router.post("/", requireAuth, async (req, res) => {
 // GET /api/employees   (SRS-006) — search, filter, sort, pagination
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const { search, department_id, status, role, has_device, sort, page = 1, limit = 20 } = req.query;
+    const { search, department_id, status, role, has_device, sort, page = 1, limit = 20, organization_id } = req.query;
+
+    const orgId = req.user.is_super_admin ? organization_id : req.user.organization_id;
+    if (!orgId) {
+      return res.status(400).json({ error: "organization_id is required" });
+    }
+
     const conditions = ["d.organization_id = $1"];
-    const params = [req.user.organization_id];
+    const params = [orgId];
 
     if (search) {
       params.push(`%${search}%`);
@@ -132,11 +150,11 @@ router.put("/:id", requireAuth, async (req, res) => {
     const { id } = req.params;
     const { first_name, last_name, email, phone_number, designation, status } = req.body;
 
-    const existing = await pool.query(
-      `SELECT e.* FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1 AND d.organization_id = $2`,
-      [id, req.user.organization_id]
-    );
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
 
     const name = first_name && last_name ? `${first_name} ${last_name}`.trim() : null;
 
@@ -144,7 +162,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       const dupEmail = await pool.query(
         `SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id
          WHERE d.organization_id = $1 AND e.email = $2 AND e.id != $3`,
-        [req.user.organization_id, email, id]
+        [empOrgId, email, id]
       );
       if (dupEmail.rows.length > 0) return res.status(409).json({ error: "Email already exists" });
     }
@@ -156,7 +174,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       [name, email, phone_number, designation, status, id]
     );
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_updated", status: "success", req });
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_updated", status: "success", req });
     res.json({ message: "Employee updated", employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -170,19 +188,19 @@ router.patch("/:id/department", requireAuth, async (req, res) => {
     const { id } = req.params;
     const { department_id } = req.body;
 
-    const dept = await departmentBelongsToOrg(department_id, req.user.organization_id);
-    if (!dept) return res.status(400).json({ error: "Department not found" });
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const dept = await getDepartmentAnyOrg(department_id);
+    if (!dept || dept.organization_id !== empOrgId) return res.status(400).json({ error: "Department not found" });
     if (dept.status !== "active") return res.status(400).json({ error: "Department is not active" });
 
-    const result = await pool.query(
-      `UPDATE employees e SET department_id = $1
-       FROM departments d WHERE e.id = $2 AND e.department_id = d.id AND d.organization_id = $3
-       RETURNING e.*`,
-      [department_id, id, req.user.organization_id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+    const result = await pool.query("UPDATE employees SET department_id = $1 WHERE id = $2 RETURNING *", [department_id, id]);
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_department_changed", status: "success", req });
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_department_changed", status: "success", req });
     res.json({ message: "Department changed", employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -199,15 +217,15 @@ router.patch("/:id/role", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Role must be OrganizationAdmin, DepartmentManager, or Employee" });
     }
 
-    const result = await pool.query(
-      `UPDATE employees e SET role = $1
-       FROM departments d WHERE e.id = $2 AND e.department_id = d.id AND d.organization_id = $3
-       RETURNING e.*`,
-      [role, id, req.user.organization_id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_role_changed", status: "success", req });
+    const result = await pool.query("UPDATE employees SET role = $1 WHERE id = $2 RETURNING *", [role, id]);
+
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_role_changed", status: "success", req });
     res.json({ message: "Role updated", employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -224,12 +242,14 @@ router.patch("/:id/assign-device", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "device_uid is required" });
     }
 
-    const empResult = await pool.query(
-      `SELECT e.* FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1 AND d.organization_id = $2`,
-      [id, req.user.organization_id]
-    );
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const empResult = await pool.query("SELECT * FROM employees WHERE id = $1", [id]);
     const employee = empResult.rows[0];
-    if (!employee) return res.status(404).json({ error: "Employee not found" });
 
     // BR-05: suspended employees cannot receive new device assignments
     if (employee.status === "suspended") {
@@ -238,11 +258,11 @@ router.patch("/:id/assign-device", requireAuth, async (req, res) => {
 
     const deviceResult = await pool.query(
       "SELECT id FROM devices WHERE device_uid = $1 AND organization_id = $2",
-      [device_uid, req.user.organization_id]
+      [device_uid, empOrgId]
     );
     const device = deviceResult.rows[0];
     if (!device) {
-      return res.status(404).json({ error: "Device not found in your organization" });
+      return res.status(404).json({ error: "Device not found in this organization" });
     }
 
     // BR-04: one device can only be assigned to one employee at a time
@@ -251,15 +271,9 @@ router.patch("/:id/assign-device", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "Selected device is already assigned to another employee" });
     }
 
-    const result = await pool.query(
-      `UPDATE employees e SET device_id = $1
-       FROM departments d
-       WHERE e.id = $2 AND e.department_id = d.id AND d.organization_id = $3
-       RETURNING e.*`,
-      [device.id, id, req.user.organization_id]
-    );
+    const result = await pool.query("UPDATE employees SET device_id = $1 WHERE id = $2 RETURNING *", [device.id, id]);
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_device_assigned", status: "success", req });
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_device_assigned", status: "success", req });
     res.json({ message: "Device assigned", employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -276,16 +290,15 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "status must be 'active' or 'suspended'" });
     }
 
-    const result = await pool.query(
-      `UPDATE employees e SET status = $1
-       FROM departments d
-       WHERE e.id = $2 AND e.department_id = d.id AND d.organization_id = $3
-       RETURNING e.*`,
-      [status, id, req.user.organization_id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: `employee_${status}`, status: "success", req });
+    const result = await pool.query("UPDATE employees SET status = $1 WHERE id = $2 RETURNING *", [status, id]);
+
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: `employee_${status}`, status: "success", req });
     res.json({ message: `Employee ${status}`, employee: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -297,17 +310,17 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const existing = await pool.query(
-      `SELECT e.* FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1 AND d.organization_id = $2`,
-      [id, req.user.organization_id]
-    );
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
 
     // Clear any department that has this employee set as its manager first
     await pool.query("UPDATE departments SET manager_employee_id = NULL WHERE manager_employee_id = $1", [id]);
     await pool.query("DELETE FROM employees WHERE id = $1", [id]);
 
-    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "employee_deleted", status: "success", req });
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_deleted", status: "success", req });
     res.json({ message: "Employee deleted" });
   } catch (err) {
     console.error(err);
