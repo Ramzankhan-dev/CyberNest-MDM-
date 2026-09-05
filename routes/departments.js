@@ -1,21 +1,45 @@
 const express = require("express");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
 
-// POST /api/departments   (Admin only)
+function isValidCode(code) {
+  return /^[A-Z0-9]{2,20}$/.test(code);
+}
+
+// POST /api/departments   (SRS-005)
 router.post("/", requireAuth, async (req, res) => {
   try {
-    const { name, default_policy_id } = req.body;
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: "name is required" });
+    const { name, code, manager_employee_id, description, default_policy_id, status } = req.body;
+
+    if (!name || name.trim().length < 3 || name.trim().length > 100) {
+      return res.status(400).json({ error: "Department name is required (3-100 characters)" });
     }
-    const result = await pool.query(
-      `INSERT INTO departments (organization_id, name, default_policy_id)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [req.user.organization_id, name.trim(), default_policy_id || null]
+    if (!code || !isValidCode(code)) {
+      return res.status(400).json({ error: "Department code must be 2-20 uppercase letters/numbers" });
+    }
+
+    const dupCode = await pool.query(
+      "SELECT id FROM departments WHERE organization_id = $1 AND code = $2",
+      [req.user.organization_id, code]
     );
+    if (dupCode.rows.length > 0) return res.status(409).json({ error: "Department code already exists" });
+
+    const dupName = await pool.query(
+      "SELECT id FROM departments WHERE organization_id = $1 AND LOWER(name) = LOWER($2)",
+      [req.user.organization_id, name.trim()]
+    );
+    if (dupName.rows.length > 0) return res.status(409).json({ error: "Department name already exists" });
+
+    const result = await pool.query(
+      `INSERT INTO departments (organization_id, name, code, manager_employee_id, description, default_policy_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.user.organization_id, name.trim(), code, manager_employee_id || null, description || null, default_policy_id || null, status || "active"]
+    );
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "department_created", status: "success", req, details: name });
     res.status(201).json({ message: "Department created", department: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -23,20 +47,137 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/departments   (Admin only) — this org's departments, with employee/device counts
+// GET /api/departments   (SRS-005) — search, sort, filter, pagination
 router.get("/", requireAuth, async (req, res) => {
   try {
+    const { search, status, sort, page = 1, limit = 20 } = req.query;
+    const conditions = ["d.organization_id = $1"];
+    const params = [req.user.organization_id];
+
+    if (search) {
+      params.push(`%${search}%`);
+      conditions.push(`(d.name ILIKE $${params.length} OR d.code ILIKE $${params.length} OR mgr.name ILIKE $${params.length})`);
+    }
+    if (status) {
+      params.push(status);
+      conditions.push(`d.status = $${params.length}`);
+    }
+
+    let orderBy = "d.created_at DESC";
+    if (sort === "name") orderBy = "d.name ASC";
+    else if (sort === "employee_count") orderBy = "employee_count DESC";
+    else if (sort === "device_count") orderBy = "device_count DESC";
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    params.push(parseInt(limit), offset);
+
     const result = await pool.query(
-      `SELECT d.*, p.name AS policy_name,
+      `SELECT d.*, p.name AS policy_name, mgr.name AS manager_name,
               (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id) AS employee_count,
-              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.device_id IS NOT NULL) AS device_count
+              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.device_id IS NOT NULL) AS device_count,
+              (SELECT COUNT(*) FROM employees e JOIN devices dv ON e.device_id = dv.id
+                WHERE e.department_id = d.id AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
        FROM departments d
        LEFT JOIN policies p ON d.default_policy_id = p.id
-       WHERE d.organization_id = $1
-       ORDER BY d.created_at DESC`,
-      [req.user.organization_id]
+       LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY ${orderBy}
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
     );
-    res.json(result.rows);
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*) FROM departments d LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id WHERE ${conditions.join(" AND ")}`,
+      params.slice(0, conditions.length)
+    );
+
+    res.json({
+      departments: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      page: parseInt(page),
+      limit: parseInt(limit),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/departments/:id   (SRS-005)
+router.put("/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, default_policy_id, status } = req.body;
+
+    if (name) {
+      const dupName = await pool.query(
+        "SELECT id FROM departments WHERE organization_id = $1 AND LOWER(name) = LOWER($2) AND id != $3",
+        [req.user.organization_id, name.trim(), id]
+      );
+      if (dupName.rows.length > 0) return res.status(409).json({ error: "Department name already exists" });
+    }
+
+    const result = await pool.query(
+      `UPDATE departments SET name = COALESCE($1, name), description = COALESCE($2, description),
+        default_policy_id = COALESCE($3, default_policy_id), status = COALESCE($4, status)
+       WHERE id = $5 AND organization_id = $6 RETURNING *`,
+      [name, description, default_policy_id, status, id, req.user.organization_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Department not found" });
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "department_updated", status: "success", req });
+    res.json({ message: "Department updated", department: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /api/departments/:id/manager   (SRS-005 FR-06)
+router.patch("/:id/manager", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { manager_employee_id } = req.body;
+
+    if (manager_employee_id) {
+      const emp = await pool.query(
+        "SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1 AND d.organization_id = $2 AND e.status = 'active'",
+        [manager_employee_id, req.user.organization_id]
+      );
+      if (emp.rows.length === 0) return res.status(400).json({ error: "Selected manager is invalid" });
+    }
+
+    const result = await pool.query(
+      "UPDATE departments SET manager_employee_id = $1 WHERE id = $2 AND organization_id = $3 RETURNING *",
+      [manager_employee_id || null, id, req.user.organization_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Department not found" });
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "department_manager_assigned", status: "success", req });
+    res.json({ message: "Manager assigned", department: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE /api/departments/:id   (SRS-005 BR-05)
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const empCount = await pool.query("SELECT COUNT(*) FROM employees WHERE department_id = $1", [id]);
+    if (parseInt(empCount.rows[0].count) > 0) {
+      return res.status(409).json({ error: "Cannot delete a department with employees assigned. Reassign or remove them first." });
+    }
+
+    const result = await pool.query(
+      "UPDATE departments SET status = 'disabled' WHERE id = $1 AND organization_id = $2 RETURNING *",
+      [id, req.user.organization_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Department not found" });
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "department_deleted", status: "success", req });
+    res.json({ message: "Department deleted" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
