@@ -12,6 +12,12 @@ const departmentRoutes = require("./routes/departments");
 const employeeRoutes = require("./routes/employees");
 
 const app = express();
+
+// Render sits behind a reverse proxy — this tells Express to trust its
+// X-Forwarded-For header, which express-rate-limit needs to correctly
+// identify each client by IP (without this it throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR).
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json());
 

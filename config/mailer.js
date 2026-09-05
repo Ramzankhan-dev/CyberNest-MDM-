@@ -1,25 +1,31 @@
-const nodemailer = require("nodemailer");
 require("dotenv").config();
 
-// Sends real emails (OTPs, etc.) via Gmail SMTP.
-// Needs EMAIL_USER (a Gmail address) and EMAIL_PASSWORD (a 16-character
-// "App Password" — NOT the normal Gmail password) as environment variables.
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
-  },
-});
-
+// Uses Brevo's HTTPS REST API (not raw SMTP) — Render's free tier blocks
+// outbound SMTP, so this avoids that entirely. No extra npm package
+// needed since Node 18+ has fetch() built in.
+//
+// Setup: create a free Brevo account (brevo.com), verify a sender email
+// under Senders & IP > Senders, then create an API key under
+// Settings (gear icon) > SMTP & API > API Keys > Generate a new API key.
 async function sendOtpEmail(toEmail, otp) {
-  await transporter.sendMail({
-    from: `"CyberNest" <${process.env.EMAIL_USER}>`,
-    to: toEmail,
-    subject: "Your CyberNest password reset code",
-    text: `Your verification code is ${otp}. It expires in 5 minutes. If you didn't request this, you can ignore this email.`,
-    html: `<p>Your verification code is:</p><h2 style="letter-spacing:4px">${otp}</h2><p>This code expires in 5 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": process.env.BREVO_API_KEY,
+    },
+    body: JSON.stringify({
+      sender: { email: process.env.BREVO_FROM_EMAIL, name: "CyberNest" },
+      to: [{ email: toEmail }],
+      subject: "Your CyberNest password reset code",
+      htmlContent: `<p>Your verification code is:</p><h2 style="letter-spacing:4px">${otp}</h2><p>This code expires in 5 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+    }),
   });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Brevo email send failed: ${response.status} ${errorBody}`);
+  }
 }
 
 module.exports = { sendOtpEmail };
