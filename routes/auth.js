@@ -76,8 +76,9 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT u.*, r.name AS role_name FROM users u
+      `SELECT u.*, r.name AS role_name, o.status AS org_status FROM users u
        LEFT JOIN roles r ON u.role_id = r.id
+       LEFT JOIN organizations o ON u.organization_id = o.id
        WHERE u.email = $1`,
       [email]
     );
@@ -91,6 +92,12 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     if (user.status === "suspended") {
       await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Account suspended" });
       return res.status(403).json({ error: "Your account has been disabled. Contact your administrator." });
+    }
+
+    // FR-07 (SRS-004): a suspended organization blocks its admins from logging in
+    if (!user.is_super_admin && user.org_status === "suspended") {
+      await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Organization suspended" });
+      return res.status(403).json({ error: "Your organization has been suspended. Contact CyberNest support." });
     }
 
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
@@ -112,7 +119,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     await pool.query("UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1", [user.id]);
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id },
+      { id: user.id, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id, is_super_admin: !!user.is_super_admin },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
@@ -139,7 +146,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
       refreshToken,
       role: user.role_name || user.role,
       organizationId: user.organization_id,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id },
+      user: { id: user.id, name: user.name, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id, is_super_admin: !!user.is_super_admin },
     });
   } catch (err) {
     console.error(err);
