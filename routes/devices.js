@@ -4,6 +4,7 @@ const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 
 const logAudit = require("../utils/auditLog");
+const admin = require("../config/firebase");
 
 const router = express.Router();
 
@@ -13,13 +14,20 @@ const router = express.Router();
 // gets turned into a QR code on the frontend later.
 router.post("/generate-token", requireAuth, async (req, res) => {
   try {
-    const { employee_name } = req.body;
+    const { employee_name, enrollment_profile_id } = req.body;
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
 
+    let expiryHours = 24;
+    if (enrollment_profile_id) {
+      const profile = await pool.query("SELECT token_expiry_hours FROM enrollment_profiles WHERE id = $1", [enrollment_profile_id]);
+      if (profile.rows[0]) expiryHours = profile.rows[0].token_expiry_hours;
+    }
+    const tokenExpiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000);
+
     const result = await pool.query(
-      `INSERT INTO devices (device_uid, employee_name, status, organization_id)
-       VALUES ($1, $2, 'pending', $3) RETURNING *`,
-      [device_uid, employee_name || null, req.user.organization_id]
+      `INSERT INTO devices (device_uid, employee_name, status, organization_id, enrollment_profile_id, token_expires_at)
+       VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING *`,
+      [device_uid, employee_name || null, req.user.organization_id, enrollment_profile_id || null, tokenExpiresAt]
     );
 
     res.status(201).json({ message: "Enrollment token generated", device: result.rows[0] });
@@ -39,6 +47,16 @@ router.post("/confirm", async (req, res) => {
       return res.status(400).json({ error: "device_uid is required" });
     }
 
+    // BR-03 (SRS-013): enrollment tokens expire after their configured validity period
+    const existing = await pool.query("SELECT * FROM devices WHERE device_uid = $1", [device_uid]);
+    const pendingDevice = existing.rows[0];
+    if (!pendingDevice) {
+      return res.status(404).json({ error: "Invalid device_uid — enroll from the dashboard first" });
+    }
+    if (pendingDevice.token_expires_at && new Date(pendingDevice.token_expires_at) < new Date()) {
+      return res.status(410).json({ error: "Enrollment token has expired" });
+    }
+
     const result = await pool.query(
       `UPDATE devices
        SET imei = $1, model = $2, android_version = $3, fcm_token = $4,
@@ -47,11 +65,38 @@ router.post("/confirm", async (req, res) => {
       [imei, model, android_version, fcm_token, device_uid]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Invalid device_uid — enroll from the dashboard first" });
+    const device = result.rows[0];
+
+    // FR-09/FR-10 + BR-05: apply the enrollment profile's default policy
+    // right away, the moment enrollment completes.
+    if (device.enrollment_profile_id) {
+      const profile = await pool.query("SELECT * FROM enrollment_profiles WHERE id = $1", [device.enrollment_profile_id]);
+      const defaultPolicyId = profile.rows[0]?.default_policy_id;
+      if (defaultPolicyId && fcm_token) {
+        const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [defaultPolicyId]);
+        const policy = policyResult.rows[0];
+        if (policy) {
+          const commandTypes = [];
+          if (policy.camera_blocked) commandTypes.push("block_camera");
+          if (policy.bluetooth_blocked) commandTypes.push("block_bluetooth");
+          if (policy.wifi_restricted) commandTypes.push("block_wifi");
+          if (policy.usb_transfer_blocked) commandTypes.push("block_usb");
+          for (const cmdType of commandTypes) {
+            try {
+              const cmdLog = await pool.query(
+                `INSERT INTO commands (device_id, command_type, status) VALUES ($1, $2, 'pending') RETURNING *`,
+                [device.id, cmdType]
+              );
+              await admin.messaging().send({ token: fcm_token, data: { command: cmdType, command_id: String(cmdLog.rows[0].id) } });
+              await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [cmdLog.rows[0].id]);
+            } catch (e) { /* best-effort — enrollment still succeeds either way */ }
+          }
+          await pool.query("INSERT INTO device_policies (device_id, policy_id) VALUES ($1, $2)", [device.id, policy.id]);
+        }
+      }
     }
 
-    res.json({ message: "Device enrolled successfully", device: result.rows[0] });
+    res.json({ message: "Device enrolled successfully", device });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
