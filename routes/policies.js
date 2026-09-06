@@ -59,7 +59,8 @@ router.post("/", requireAuth, async (req, res) => {
 
     POLICY_FIELDS.forEach((field) => {
       columns.push(field);
-      values.push(req.body[field] ?? null);
+      const val = req.body[field];
+      values.push(val === "" || val === undefined ? null : val);
       placeholders.push(`$${values.length}`);
     });
 
@@ -160,7 +161,8 @@ router.put("/:id", requireAuth, async (req, res) => {
 
     POLICY_FIELDS.forEach((field) => {
       if (req.body[field] !== undefined) {
-        values.push(req.body[field]);
+        const val = req.body[field];
+        values.push(val === "" ? null : val);
         setClauses.push(`${field} = $${values.length}`);
       }
     });
