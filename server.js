@@ -11,6 +11,7 @@ const organizationRoutes = require("./routes/organizations");
 const departmentRoutes = require("./routes/departments");
 const employeeRoutes = require("./routes/employees");
 const dashboardRoutes = require("./routes/dashboard");
+const complianceRoutes = require("./routes/compliance");
 
 const app = express();
 
@@ -36,6 +37,7 @@ app.use("/api/organizations", organizationRoutes);
 app.use("/api/departments", departmentRoutes);
 app.use("/api/employees", employeeRoutes);
 app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/compliance", complianceRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
