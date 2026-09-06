@@ -39,6 +39,7 @@ router.get("/", requireAuth, requireSuperAdmin, async (req, res) => {
     else if (sort === "device_count") orderBy = "device_count DESC";
     else if (sort === "status") orderBy = "o.status ASC";
 
+    const filterParamCount = params.length;
     const offset = (parseInt(page) - 1) * parseInt(limit);
     params.push(parseInt(limit), offset);
 
@@ -55,7 +56,7 @@ router.get("/", requireAuth, requireSuperAdmin, async (req, res) => {
       params
     );
 
-    const countResult = await pool.query(`SELECT COUNT(*) FROM organizations o ${whereClause}`, params.slice(0, conditions.length));
+    const countResult = await pool.query(`SELECT COUNT(*) FROM organizations o ${whereClause}`, params.slice(0, filterParamCount));
 
     res.json({
       organizations: result.rows,

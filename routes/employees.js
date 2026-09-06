@@ -118,6 +118,7 @@ router.get("/", requireAuth, async (req, res) => {
     if (sort === "name") orderBy = "e.name ASC";
     else if (sort === "department") orderBy = "d.name ASC";
 
+    const filterParamCount = params.length; // exact count of params actually used by `conditions` above
     const offset = (parseInt(page) - 1) * parseInt(limit);
     params.push(parseInt(limit), offset);
 
@@ -134,7 +135,7 @@ router.get("/", requireAuth, async (req, res) => {
 
     const countResult = await pool.query(
       `SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE ${conditions.join(" AND ")}`,
-      params.slice(0, conditions.length)
+      params.slice(0, filterParamCount)
     );
 
     res.json({ employees: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit: parseInt(limit) });

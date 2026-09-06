@@ -92,6 +92,7 @@ router.get("/", requireAuth, async (req, res) => {
     else if (sort === "android_version") orderBy = "dv.android_version ASC";
     else if (sort === "last_sync") orderBy = "dv.last_seen DESC NULLS LAST";
 
+    const filterParamCount = params.length; // exact count of params actually used by `conditions` above
     const offset = (parseInt(page) - 1) * parseInt(limit);
     params.push(parseInt(limit), offset);
 
@@ -111,7 +112,7 @@ router.get("/", requireAuth, async (req, res) => {
        LEFT JOIN employees e ON e.device_id = dv.id
        LEFT JOIN departments d ON e.department_id = d.id
        WHERE ${conditions.join(" AND ")}`,
-      params.slice(0, conditions.length)
+      params.slice(0, filterParamCount)
     );
 
     res.json({ devices: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit: parseInt(limit) });

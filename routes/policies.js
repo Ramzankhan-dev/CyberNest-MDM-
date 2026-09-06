@@ -101,6 +101,7 @@ router.get("/", requireAuth, async (req, res) => {
     let orderBy = "p.updated_at DESC NULLS LAST, p.created_at DESC";
     if (sort === "name") orderBy = "p.name ASC";
 
+    const filterParamCount = params.length;
     const offset = (parseInt(page) - 1) * parseInt(limit);
     params.push(parseInt(limit), offset);
 
@@ -115,7 +116,7 @@ router.get("/", requireAuth, async (req, res) => {
       params
     );
 
-    const countResult = await pool.query(`SELECT COUNT(*) FROM policies p WHERE ${conditions.join(" AND ")}`, params.slice(0, conditions.length));
+    const countResult = await pool.query(`SELECT COUNT(*) FROM policies p WHERE ${conditions.join(" AND ")}`, params.slice(0, filterParamCount));
 
     res.json({ policies: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {

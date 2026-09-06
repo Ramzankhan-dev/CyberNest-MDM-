@@ -79,6 +79,7 @@ router.get("/", requireAuth, async (req, res) => {
     else if (sort === "employee_count") orderBy = "employee_count DESC";
     else if (sort === "device_count") orderBy = "device_count DESC";
 
+    const filterParamCount = params.length;
     const offset = (parseInt(page) - 1) * parseInt(limit);
     params.push(parseInt(limit), offset);
 
@@ -99,7 +100,7 @@ router.get("/", requireAuth, async (req, res) => {
 
     const countResult = await pool.query(
       `SELECT COUNT(*) FROM departments d LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id WHERE ${conditions.join(" AND ")}`,
-      params.slice(0, conditions.length)
+      params.slice(0, filterParamCount)
     );
 
     res.json({
