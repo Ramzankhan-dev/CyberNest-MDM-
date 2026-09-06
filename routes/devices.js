@@ -21,6 +21,10 @@ router.post("/generate-token", requireAuth, async (req, res) => {
     if (enrollment_profile_id) {
       const profile = await pool.query("SELECT token_expiry_hours FROM enrollment_profiles WHERE id = $1", [enrollment_profile_id]);
       if (profile.rows[0]) expiryHours = profile.rows[0].token_expiry_hours;
+    } else {
+      // SRS-017: fall back to the organization's configured default QR expiry
+      const orgSettings = await pool.query("SELECT default_qr_expiry_hours FROM organization_settings WHERE organization_id = $1", [req.user.organization_id]);
+      if (orgSettings.rows[0]) expiryHours = orgSettings.rows[0].default_qr_expiry_hours;
     }
     const tokenExpiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000);
 

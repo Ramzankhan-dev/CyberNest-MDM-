@@ -15,6 +15,7 @@ const complianceRoutes = require("./routes/compliance");
 const applicationRoutes = require("./routes/applications");
 const enrollmentRoutes = require("./routes/enrollment");
 const auditLogRoutes = require("./routes/auditLogs");
+const settingsRoutes = require("./routes/settings");
 
 const app = express();
 
@@ -44,6 +45,7 @@ app.use("/api/compliance", complianceRoutes);
 app.use("/api/applications", applicationRoutes);
 app.use("/api/enrollment", enrollmentRoutes);
 app.use("/api/audit-logs", auditLogRoutes);
+app.use("/api/settings", settingsRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {

@@ -105,12 +105,22 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     }
 
     const validPassword = await bcrypt.compare(password, user.password_hash);
+
+    // SRS-017: Security settings (lockout threshold/duration, session
+    // length) are per-organization configurable — fall back to sane
+    // defaults if the org hasn't set any yet.
+    let orgSettings = { max_failed_login_attempts: MAX_FAILED_ATTEMPTS, lockout_duration_minutes: LOCK_DURATION_MINUTES, session_timeout_days: 7 };
+    if (user.organization_id) {
+      const settingsResult = await pool.query("SELECT * FROM organization_settings WHERE organization_id = $1", [user.organization_id]);
+      if (settingsResult.rows[0]) orgSettings = settingsResult.rows[0];
+    }
+
     if (!validPassword) {
       const attempts = (user.failed_login_attempts || 0) + 1;
-      const shouldLock = attempts >= MAX_FAILED_ATTEMPTS;
+      const shouldLock = attempts >= orgSettings.max_failed_login_attempts;
       await pool.query(
         `UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE id = $3`,
-        [attempts, shouldLock ? new Date(Date.now() + LOCK_DURATION_MINUTES * 60 * 1000) : null, user.id]
+        [attempts, shouldLock ? new Date(Date.now() + orgSettings.lockout_duration_minutes * 60 * 1000) : null, user.id]
       );
       await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Wrong password" });
       return res.status(401).json({ error: "Invalid email or password" });
@@ -121,7 +131,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id, is_super_admin: !!user.is_super_admin },
       process.env.JWT_SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: `${orgSettings.session_timeout_days || 7}d` }
     );
 
     const refreshToken = crypto.randomBytes(40).toString("hex");
