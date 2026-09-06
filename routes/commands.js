@@ -2,6 +2,7 @@ const express = require("express");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
+const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
 
@@ -59,6 +60,16 @@ router.post("/send", requireAuth, async (req, res) => {
       "UPDATE commands SET status = 'sent' WHERE id = $1",
       [commandLog.rows[0].id]
     );
+
+    // FR-18 (SRS-007): every device operation is recorded in Audit Logs
+    await logAudit({
+      userId: req.user.id,
+      organizationId: device.organization_id,
+      action: `command_${command_type}`,
+      status: "success",
+      req,
+      details: `Device ${device.device_uid}`,
+    });
 
     res.json({ message: "Command sent", command: commandLog.rows[0] });
   } catch (err) {
