@@ -233,20 +233,36 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/policies/:id/unassign   (removes this policy's device assignments)
-// Note: this clears the assignment record so the policy CAN be deleted —
-// it does not automatically reverse the restrictions already applied on
-// the device (that would need explicit "unblock_*" commands sent back).
+// Genuinely reverses the policy on each device — sends the matching
+// unblock_* commands — then clears the assignment record.
 router.delete("/:id/unassign", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const existing = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
+    const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
+    const policy = policyResult.rows[0];
+    if (!policy) return res.status(404).json({ error: "Policy not found" });
 
-    const result = await pool.query("DELETE FROM device_policies WHERE policy_id = $1 RETURNING device_id", [id]);
+    const assignedDevices = await pool.query(
+      `SELECT DISTINCT dv.* FROM devices dv JOIN device_policies dp ON dp.device_id = dv.id WHERE dp.policy_id = $1`,
+      [id]
+    );
+
+    const unblockCommands = buildUnblockCommandsForPolicy(policy);
+    let notified = 0;
+    for (const device of assignedDevices.rows) {
+      if (device.fcm_token) {
+        for (const cmd of unblockCommands) {
+          await sendCommandToDevice(device, cmd.type, req.user.id, cmd.extra || {});
+        }
+        notified++;
+      }
+    }
+
+    await pool.query("DELETE FROM device_policies WHERE policy_id = $1", [id]);
     await pool.query("UPDATE departments SET default_policy_id = NULL WHERE default_policy_id = $1", [id]);
 
-    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "policy_unassigned_all", status: "success", req, details: `${result.rows.length} device(s)` });
-    res.json({ message: `Unassigned from ${result.rows.length} device(s)`, count: result.rows.length });
+    await logAudit({ userId: req.user.id, organizationId: policy.organization_id, action: "policy_unassigned_all", status: "success", req, details: `${assignedDevices.rows.length} device(s), ${notified} notified` });
+    res.json({ message: `Reversed and unassigned from ${assignedDevices.rows.length} device(s)`, count: assignedDevices.rows.length });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -321,6 +337,30 @@ function buildCommandsForPolicy(policy) {
     });
   }
   if (policy.kiosk_mode) commands.push({ type: "enable_kiosk", extra: policy.kiosk_package ? { package_name: policy.kiosk_package } : {} });
+  return commands;
+}
+
+// Mirrors buildCommandsForPolicy — sends the opposite (unblock_*) commands
+// so unassigning a policy genuinely reverses it on the device, not just
+// clears the database record.
+function buildUnblockCommandsForPolicy(policy) {
+  const commands = [];
+  if (policy.camera_blocked) commands.push({ type: "unblock_camera" });
+  if (policy.bluetooth_blocked) commands.push({ type: "unblock_bluetooth" });
+  if (policy.wifi_restricted) commands.push({ type: "unblock_wifi" });
+  if (policy.usb_transfer_blocked) commands.push({ type: "unblock_usb" });
+  if (policy.screenshot_blocked) commands.push({ type: "unblock_screenshot" });
+  if (policy.usb_debugging_blocked) commands.push({ type: "unblock_usb_debugging" });
+  if (policy.mobile_hotspot_blocked) commands.push({ type: "unblock_hotspot" });
+  if (policy.airplane_mode_blocked) commands.push({ type: "unblock_airplane_mode" });
+  if (policy.location_services_blocked) commands.push({ type: "unblock_location" });
+  if (policy.factory_reset_blocked) commands.push({ type: "unblock_factory_reset" });
+  if (policy.blocked_apps) {
+    policy.blocked_apps.split(",").map((p) => p.trim()).filter(Boolean).forEach((pkg) => {
+      commands.push({ type: "unblock_app", extra: { package_name: pkg } });
+    });
+  }
+  if (policy.kiosk_mode) commands.push({ type: "disable_kiosk" });
   return commands;
 }
 
