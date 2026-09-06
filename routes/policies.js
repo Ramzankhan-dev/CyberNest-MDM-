@@ -232,6 +232,27 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
   }
 });
 
+// DELETE /api/policies/:id/unassign   (removes this policy's device assignments)
+// Note: this clears the assignment record so the policy CAN be deleted —
+// it does not automatically reverse the restrictions already applied on
+// the device (that would need explicit "unblock_*" commands sent back).
+router.delete("/:id/unassign", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
+
+    const result = await pool.query("DELETE FROM device_policies WHERE policy_id = $1 RETURNING device_id", [id]);
+    await pool.query("UPDATE departments SET default_policy_id = NULL WHERE default_policy_id = $1", [id]);
+
+    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "policy_unassigned_all", status: "success", req, details: `${result.rows.length} device(s)` });
+    res.json({ message: `Unassigned from ${result.rows.length} device(s)`, count: result.rows.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // DELETE /api/policies/:id   (SRS-009 BR-05)
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
