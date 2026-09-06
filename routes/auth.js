@@ -405,4 +405,114 @@ router.get("/api-keys", requireAuth, async (req, res) => {
   }
 });
 
+// ===================== EMPLOYEE LOGIN (SRS-A04) =====================
+// Separate from the Admin/SuperAdmin login above — a different table
+// (employees, not users), a different id space, and JWTs carry
+// { type: "employee" } so the two can never be confused by
+// middleware. Login is only required when the device's Enrollment
+// Profile has require_employee_login = true (BR-01) — that check
+// happens on the agent side (it decides whether to show this screen
+// at all); this endpoint just authenticates whoever is presented.
+
+router.post("/employee-login", loginRateLimiter, async (req, res) => {
+  try {
+    const { employee_id, password } = req.body; // employee_id = employee_code OR email
+    if (!employee_id || !password) {
+      return res.status(400).json({ error: "Employee ID and password are required" });
+    }
+
+    const result = await pool.query(
+      `SELECT e.*, d.name AS department_name, d.organization_id
+       FROM employees e
+       JOIN departments d ON e.department_id = d.id
+       WHERE e.employee_code = $1 OR e.email = $1`,
+      [employee_id]
+    );
+    const employee = result.rows[0];
+
+    if (!employee || !employee.password_hash) {
+      await logAudit({ action: "employee_login_failed", status: "failure", req, details: `No account/password set for ${employee_id}` });
+      return res.status(401).json({ error: "Invalid Employee ID or Password" });
+    }
+    if (employee.status !== "active") {
+      await logAudit({ organizationId: employee.organization_id, action: "employee_login_failed", status: "failure", req, details: "Account disabled" });
+      return res.status(403).json({ error: "Your account has been disabled" });
+    }
+
+    const validPassword = await bcrypt.compare(password, employee.password_hash);
+    if (!validPassword) {
+      await logAudit({ organizationId: employee.organization_id, action: "employee_login_failed", status: "failure", req, details: "Wrong password" });
+      return res.status(401).json({ error: "Invalid Employee ID or Password" });
+    }
+
+    const token = jwt.sign(
+      { type: "employee", id: employee.id, employee_code: employee.employee_code, department_id: employee.department_id, organization_id: employee.organization_id },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    const refreshToken = crypto.randomBytes(40).toString("hex");
+    await pool.query(
+      `INSERT INTO employee_sessions (employee_id, refresh_token, device_uid, ip_address, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [employee.id, refreshToken, req.body.device_uid || null, req.headers["x-forwarded-for"] || req.socket.remoteAddress, new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)]
+    );
+
+    await logAudit({ organizationId: employee.organization_id, action: "employee_login_success", status: "success", req, details: employee.employee_code });
+
+    res.json({
+      success: true,
+      token,
+      refreshToken,
+      employee: {
+        id: employee.id, name: employee.name, employee_code: employee.employee_code,
+        email: employee.email, department: employee.department_name, role: employee.role,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/employee-refresh", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: "refreshToken is required" });
+
+    const result = await pool.query(
+      `SELECT es.*, e.employee_code, e.department_id, e.organization_id, e.status
+       FROM employee_sessions es JOIN employees e ON es.employee_id = e.id
+       WHERE es.refresh_token = $1 AND es.revoked = FALSE`,
+      [refreshToken]
+    );
+    const session = result.rows[0];
+    if (!session || new Date(session.expires_at) < new Date() || session.status !== "active") {
+      return res.status(401).json({ error: "Session expired — please log in again" });
+    }
+
+    const token = jwt.sign(
+      { type: "employee", id: session.employee_id, employee_code: session.employee_code, department_id: session.department_id, organization_id: session.organization_id },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    res.json({ success: true, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/employee-logout", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (refreshToken) {
+      await pool.query("UPDATE employee_sessions SET revoked = TRUE WHERE refresh_token = $1", [refreshToken]);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;

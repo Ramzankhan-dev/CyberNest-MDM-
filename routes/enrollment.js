@@ -8,15 +8,15 @@ const router = express.Router();
 // POST /api/enrollment/profiles   (SRS-013 FR-01)
 router.post("/profiles", requireAuth, async (req, res) => {
   try {
-    const { name, default_policy_id, default_department_id, token_expiry_hours, organization_id } = req.body;
+    const { name, default_policy_id, default_department_id, token_expiry_hours, organization_id, require_employee_login } = req.body;
     const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
 
     if (!name || !name.trim()) return res.status(400).json({ error: "Profile name is required" });
 
     const result = await pool.query(
-      `INSERT INTO enrollment_profiles (organization_id, name, default_policy_id, default_department_id, token_expiry_hours)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [orgId, name.trim(), default_policy_id || null, default_department_id || null, token_expiry_hours || 24]
+      `INSERT INTO enrollment_profiles (organization_id, name, default_policy_id, default_department_id, token_expiry_hours, require_employee_login)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [orgId, name.trim(), default_policy_id || null, default_department_id || null, token_expiry_hours || 24, !!require_employee_login]
     );
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "enrollment_profile_created", status: "success", req, details: name });
@@ -98,6 +98,7 @@ router.get("/validate/:device_uid", async (req, res) => {
       `SELECT dv.device_uid, dv.status, dv.fcm_token, dv.token_expires_at, dv.enrollment_method,
               org.name AS organization_name,
               ep.name AS enrollment_profile_name,
+              ep.require_employee_login,
               p.name AS policy_name
        FROM devices dv
        LEFT JOIN organizations org ON dv.organization_id = org.id
@@ -131,6 +132,7 @@ router.get("/validate/:device_uid", async (req, res) => {
       enrollment_profile_name: device.enrollment_profile_name || null,
       policy_name: device.policy_name || null,
       enrollment_method: device.enrollment_method || "QR Code",
+      require_employee_login: !!device.require_employee_login,
     });
   } catch (err) {
     console.error(err);

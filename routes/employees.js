@@ -1,11 +1,59 @@
 const express = require("express");
+const bcrypt = require("bcryptjs");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
 
 const ALLOWED_ROLES = ["OrganizationAdmin", "DepartmentManager", "Employee"];
+
+// GET /api/employees/profile   (SRS-A04 FR-07/FR-08 — called by the
+// Android agent right after employee-login, with the employee's own
+// token). Placed before "/:id" routes so Express doesn't treat
+// "profile" as an :id param.
+router.get("/profile", requireEmployeeAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT e.*, d.name AS department_name, d.organization_id, o.name AS organization_name
+       FROM employees e
+       JOIN departments d ON e.department_id = d.id
+       JOIN organizations o ON d.organization_id = o.id
+       WHERE e.id = $1`,
+      [req.employee.id]
+    );
+    const employee = result.rows[0];
+    if (!employee) return res.status(404).json({ error: "Employee not found" });
+
+    // Enterprise Enhancement (SRS-A04) — "Welcome Summary" wants
+    // policies-loaded / apps-assigned counts for the employee's device.
+    let policiesLoaded = 0;
+    let applicationsAssigned = 0;
+    if (employee.device_id) {
+      const policyCount = await pool.query("SELECT COUNT(*) FROM device_policies WHERE device_id = $1", [employee.device_id]);
+      const appCount = await pool.query("SELECT COUNT(*) FROM device_apps WHERE device_id = $1", [employee.device_id]);
+      policiesLoaded = parseInt(policyCount.rows[0].count, 10);
+      applicationsAssigned = parseInt(appCount.rows[0].count, 10);
+    }
+
+    res.json({
+      id: employee.id,
+      name: employee.name,
+      employee_code: employee.employee_code,
+      email: employee.email,
+      designation: employee.designation,
+      role: employee.role,
+      department: employee.department_name,
+      organization: employee.organization_name,
+      policies_loaded: policiesLoaded,
+      applications_assigned: applicationsAssigned,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 async function getDepartmentAnyOrg(departmentId) {
   const result = await pool.query("SELECT id, status, organization_id FROM departments WHERE id = $1", [departmentId]);
@@ -19,6 +67,33 @@ async function getEmployeeOrgId(employeeId) {
   );
   return result.rows[0]?.organization_id || null;
 }
+
+// PATCH /api/employees/:id/set-password   (Admin only — employees don't
+// self-register or reset their own password from this project's UI)
+router.patch("/:id/set-password", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    const orgId = await getEmployeeOrgId(id);
+    if (!orgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && orgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await pool.query("UPDATE employees SET password_hash = $1 WHERE id = $2", [passwordHash, id]);
+
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "employee_password_set", status: "success", req, details: `employee #${id}` });
+    res.json({ message: "Password set successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 // POST /api/employees   (SRS-006)
 router.post("/", requireAuth, async (req, res) => {
