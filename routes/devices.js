@@ -72,7 +72,9 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(`%${search}%`);
       conditions.push(`(dv.employee_name ILIKE $${params.length} OR dv.device_uid ILIKE $${params.length} OR dv.model ILIKE $${params.length} OR dv.imei ILIKE $${params.length} OR e.name ILIKE $${params.length} OR d.name ILIKE $${params.length})`);
     }
-    if (department_id) {
+    if (department_id === "unassigned") {
+      conditions.push("d.id IS NULL");
+    } else if (department_id) {
       params.push(department_id);
       conditions.push(`d.id = $${params.length}`);
     }
