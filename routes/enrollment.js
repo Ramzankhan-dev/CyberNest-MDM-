@@ -86,4 +86,56 @@ router.get("/history", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/enrollment/validate/:device_uid   (Called by the Android agent, no login yet)
+// SRS-A02 — runs BEFORE /api/devices/confirm. Read-only: lets the agent
+// show a confirmation summary (org, policy, profile) and catch an
+// expired/invalid/already-used code without side effects, so the user
+// can back out before anything is actually registered.
+router.get("/validate/:device_uid", async (req, res) => {
+  const { device_uid } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT dv.device_uid, dv.status, dv.fcm_token, dv.token_expires_at, dv.enrollment_method,
+              org.name AS organization_name,
+              ep.name AS enrollment_profile_name,
+              p.name AS policy_name
+       FROM devices dv
+       LEFT JOIN organizations org ON dv.organization_id = org.id
+       LEFT JOIN enrollment_profiles ep ON dv.enrollment_profile_id = ep.id
+       LEFT JOIN policies p ON ep.default_policy_id = p.id
+       WHERE dv.device_uid = $1`,
+      [device_uid]
+    );
+    const device = result.rows[0];
+
+    if (!device) {
+      await logAudit({ action: "device_enrollment_validate", status: "failed", req, details: `${device_uid} — not found` });
+      return res.status(404).json({ error: "Invalid enrollment code" });
+    }
+    if (device.token_expires_at && new Date(device.token_expires_at) < new Date()) {
+      await logAudit({ action: "device_enrollment_validate", status: "failed", req, details: `${device_uid} — token expired` });
+      return res.status(410).json({ error: "Enrollment token has expired" });
+    }
+    // FR-10 / BR-03: a device that already completed /confirm (has an
+    // FCM token from a previous run) is already managed — block re-use
+    // of the same code rather than silently re-registering it.
+    if (device.fcm_token) {
+      await logAudit({ action: "device_enrollment_validate", status: "failed", req, details: `${device_uid} — already enrolled` });
+      return res.status(409).json({ error: "This device is already managed" });
+    }
+
+    await logAudit({ action: "device_enrollment_validate", status: "success", req, details: device_uid });
+    res.json({
+      valid: true,
+      organization_name: device.organization_name || "Unknown Organization",
+      enrollment_profile_name: device.enrollment_profile_name || null,
+      policy_name: device.policy_name || null,
+      enrollment_method: device.enrollment_method || "QR Code",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;

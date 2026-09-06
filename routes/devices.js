@@ -55,9 +55,11 @@ router.post("/confirm", async (req, res) => {
     const existing = await pool.query("SELECT * FROM devices WHERE device_uid = $1", [device_uid]);
     const pendingDevice = existing.rows[0];
     if (!pendingDevice) {
+      await logAudit({ action: "device_enrollment_confirm", status: "failed", req, details: `${device_uid} — not found` });
       return res.status(404).json({ error: "Invalid device_uid — enroll from the dashboard first" });
     }
     if (pendingDevice.token_expires_at && new Date(pendingDevice.token_expires_at) < new Date()) {
+      await logAudit({ action: "device_enrollment_confirm", status: "failed", req, details: `${device_uid} — token expired` });
       return res.status(410).json({ error: "Enrollment token has expired" });
     }
 
@@ -70,6 +72,7 @@ router.post("/confirm", async (req, res) => {
     );
 
     const device = result.rows[0];
+    await logAudit({ organizationId: device.organization_id, action: "device_enrollment_confirm", status: "success", req, details: device_uid });
 
     // FR-09/FR-10 + BR-05: apply the enrollment profile's default policy
     // right away, the moment enrollment completes.
