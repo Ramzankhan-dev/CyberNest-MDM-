@@ -285,6 +285,9 @@ router.delete("/:id", requireAuth, async (req, res) => {
     const existing = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
 
+    // Clear any enrollment profile using this as its default policy first,
+    // so the foreign key doesn't block the delete.
+    await pool.query("UPDATE enrollment_profiles SET default_policy_id = NULL WHERE default_policy_id = $1", [id]);
     await pool.query("DELETE FROM policy_versions WHERE policy_id = $1", [id]);
     await pool.query("DELETE FROM policies WHERE id = $1", [id]);
 
