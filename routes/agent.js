@@ -449,4 +449,71 @@ router.post("/unenroll-request", async (req, res) => {
   }
 });
 
+// GET /api/agent/support/contact   (SRS-A09 "Contact Admin" row)
+router.get("/support/contact", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT organization_id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const adminResult = await pool.query(
+      `SELECT u.email, u.name FROM users u
+       JOIN roles r ON u.role_id = r.id
+       WHERE u.organization_id = $1 AND r.name = 'OrganizationAdmin' AND u.status = 'active'
+       ORDER BY u.id ASC LIMIT 1`,
+      [device.organization_id]
+    );
+    const admin = adminResult.rows[0];
+
+    res.json({
+      admin_name: admin?.name || null,
+      admin_email: admin?.email || null,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/agent/support/tickets   (SRS-A09 FR-01..FR-12, simplified
+// to match the mockup — a single description field, no category/
+// priority/attachments. Notifies the admin via the existing audit log
+// so it's visible immediately without a dedicated dashboard screen.)
+router.post("/support/tickets", async (req, res) => {
+  const { device_uid, description } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+  if (!description || !description.trim()) return res.status(400).json({ error: "Please describe the issue" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id, organization_id, model FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const insertResult = await pool.query(
+      `INSERT INTO support_requests (organization_id, device_id, ticket_number, description)
+       VALUES ($1, $2, 'PENDING', $3) RETURNING id`,
+      [device.organization_id, device.id, description.trim()]
+    );
+    const ticketId = insertResult.rows[0].id;
+    const ticketNumber = `CN-${String(ticketId).padStart(6, "0")}`;
+    await pool.query("UPDATE support_requests SET ticket_number = $1 WHERE id = $2", [ticketNumber, ticketId]);
+
+    await logAudit({
+      organizationId: device.organization_id,
+      action: "support_ticket_created",
+      status: "success",
+      req,
+      details: `${ticketNumber} (${device.model || device_uid}): ${description.trim().slice(0, 100)}`,
+    });
+
+    res.json({ ticket_number: ticketNumber, message: "Support request submitted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
