@@ -420,4 +420,33 @@ router.put("/notifications/read-all", async (req, res) => {
   }
 });
 
+// POST /api/agent/unenroll-request   (SRS-A08 More screen — "Unenroll
+// device"). Per the mockup, this "requires admin approval" — an
+// employee can never self-unenroll a Device-Owner-managed phone (that
+// would defeat the point of MDM). This just logs a flagged audit
+// event so the admin sees the request and can act on it manually.
+router.post("/unenroll-request", async (req, res) => {
+  const { device_uid, reason } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT organization_id, model FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await logAudit({
+      organizationId: device.organization_id,
+      action: "device_unenroll_requested",
+      status: "success",
+      req,
+      details: `${device.model || device_uid}${reason ? " — " + reason : ""}`,
+    });
+
+    res.json({ message: "Unenroll request sent to your administrator" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
