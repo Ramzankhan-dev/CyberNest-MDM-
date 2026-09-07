@@ -527,4 +527,31 @@ router.post("/support/tickets", async (req, res) => {
   }
 });
 
+// GET /api/agent/info   (SRS-A10 About screen)
+router.get("/info", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const result = await pool.query(
+      `SELECT dv.device_uid, dv.enrolled_at, org.name AS organization_name
+       FROM devices dv
+       LEFT JOIN organizations org ON dv.organization_id = org.id
+       WHERE dv.device_uid = $1`,
+      [device_uid]
+    );
+    const device = result.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    res.json({
+      device_uid: device.device_uid,
+      organization_name: device.organization_name || "Unknown Organization",
+      enrolled_at: device.enrolled_at,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
