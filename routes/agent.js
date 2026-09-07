@@ -466,7 +466,18 @@ router.get("/support/contact", async (req, res) => {
        ORDER BY u.id ASC LIMIT 1`,
       [device.organization_id]
     );
-    const admin = adminResult.rows[0];
+    let admin = adminResult.rows[0];
+
+    // Fallback: some accounts predate role_id being set consistently
+    // at signup — rather than show "no contact" over a data quirk,
+    // fall back to any active user in the org.
+    if (!admin) {
+      const fallbackResult = await pool.query(
+        `SELECT email, name FROM users WHERE organization_id = $1 AND status = 'active' ORDER BY id ASC LIMIT 1`,
+        [device.organization_id]
+      );
+      admin = fallbackResult.rows[0];
+    }
 
     res.json({
       admin_name: admin?.name || null,
