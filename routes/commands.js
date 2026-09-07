@@ -79,9 +79,11 @@ router.post("/send", requireAuth, async (req, res) => {
 router.post("/:id/ack", async (req, res) => {
   try {
     const { id } = req.params;
+    const { status, error_message } = req.body || {};
+    const finalStatus = status === "failed" ? "failed" : "executed";
     const result = await pool.query(
-      "UPDATE commands SET status = 'executed', executed_at = NOW() WHERE id = $1 RETURNING *",
-      [id]
+      "UPDATE commands SET status = $1, executed_at = NOW(), error_message = $2 WHERE id = $3 RETURNING *",
+      [finalStatus, finalStatus === "failed" ? (error_message || null) : null, id]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Command not found" });
@@ -226,6 +228,30 @@ router.get("/:device_uid", requireAuth, async (req, res) => {
       [device_uid, req.user.organization_id]
     );
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/commands/:id/status   — used by the dashboard to poll a
+// single command's live status (e.g. after pushing an install), rather
+// than re-fetching the whole device command history.
+router.get("/:id/status", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT c.id, c.command_type, c.status, c.issued_at, c.executed_at, c.error_message, d.organization_id
+       FROM commands c JOIN devices d ON c.device_id = d.id
+       WHERE c.id = $1`,
+      [id]
+    );
+    const command = result.rows[0];
+    if (!command) return res.status(404).json({ error: "Command not found" });
+    if (!req.user.is_super_admin && command.organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Command not found" });
+    }
+    res.json(command);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

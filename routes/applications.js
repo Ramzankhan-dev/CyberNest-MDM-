@@ -377,7 +377,7 @@ router.post("/packages/:id/install", requireAuth, async (req, res) => {
       });
       await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
       await logAudit({ userId: req.user.id, organizationId: pkg.organization_id, action: "app_install_pushed", status: "success", req, details: `${pkg.app_name} -> ${device_uid}` });
-      res.json({ message: "Install command sent" });
+      res.json({ message: "Install command sent", command_id: commandLog.rows[0].id });
     } catch (err) {
       await pool.query("UPDATE commands SET status = 'failed', error_message = $1 WHERE id = $2", [err.message, commandLog.rows[0].id]);
       res.status(502).json({ error: "Failed to reach device" });
