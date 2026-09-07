@@ -245,4 +245,53 @@ router.get("/sync/history", async (req, res) => {
   }
 });
 
+// GET /api/agent/apps   (SRS-A06 enhancement — tappable app list on Sync screen)
+// Mirrors GET /api/devices/:uid/apps (admin-facing) but keyed by
+// device_uid with no dashboard auth, matching every other agent route.
+router.get("/apps", async (req, res) => {
+  const { device_uid, blocked_only } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const query = blocked_only === "true"
+      ? `SELECT package_name, app_name, status FROM device_apps WHERE device_id = $1 AND status = 'blocked' ORDER BY app_name`
+      : `SELECT package_name, app_name, status FROM device_apps WHERE device_id = $1 ORDER BY app_name`;
+    const result = await pool.query(query, [device.id]);
+    res.json({ apps: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/agent/policy-history   (SRS-A06 enhancement — tappable
+// "policy rules refreshed" row on Sync screen). Same data as the
+// dashboard's GET /api/devices/:uid/policy-history, agent-facing.
+router.get("/policy-history", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const result = await pool.query(
+      `SELECT p.name, p.camera_blocked, p.bluetooth_blocked, p.wifi_restricted,
+              p.usb_transfer_blocked, p.kiosk_mode, dp.assigned_at
+       FROM device_policies dp JOIN policies p ON dp.policy_id = p.id
+       WHERE dp.device_id = $1 ORDER BY dp.assigned_at DESC`,
+      [device.id]
+    );
+    res.json({ history: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
