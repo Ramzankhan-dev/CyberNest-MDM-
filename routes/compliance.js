@@ -3,19 +3,9 @@ const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
+const computeStatus = require("../utils/computeCompliance");
 
 const router = express.Router();
-
-// Works out a device's compliance status from what we actually know:
-// its latest policy assignment, whether it's synced since, whether any
-// recent commands for it failed, and whether it's online right now.
-function computeStatus(device, latestFailed) {
-  if (!device.policy_id) return "Unknown";
-  if (latestFailed) return "Policy Failed";
-  if (!device.last_seen || new Date(device.last_seen) < new Date(device.assigned_at)) return "Pending Sync";
-  const isOnline = new Date(device.last_seen).getTime() > Date.now() - 90000;
-  return isOnline ? "Compliant" : "Non-Compliant";
-}
 
 // GET /api/compliance   (SRS-011) — one row per device that has a policy assigned
 router.get("/", requireAuth, async (req, res) => {
