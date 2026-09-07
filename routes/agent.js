@@ -319,4 +319,105 @@ router.get("/health", async (req, res) => {
   }
 });
 
+// GET /api/agent/notifications   (SRS-A07 FR-01..FR-03)
+// Returns notifications visible to this device — targeted directly at
+// it, at its department, or broadcast org-wide — newest first, each
+// flagged with this device's own read status.
+router.get("/notifications", async (req, res) => {
+  const { device_uid, limit = 50 } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query(
+      `SELECT dv.id, dv.organization_id, e.department_id
+       FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE dv.device_uid = $1`,
+      [device_uid]
+    );
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const result = await pool.query(
+      `SELECT n.id, n.title, n.message, n.notification_type, n.priority, n.sent_at,
+              (nr.id IS NOT NULL) AS is_read
+       FROM notifications n
+       LEFT JOIN notification_reads nr ON nr.notification_id = n.id AND nr.device_id = $1
+       WHERE n.organization_id = $2
+         AND n.status = 'delivered'
+         AND (
+           n.target_device_uid = $3
+           OR (n.target_department_id IS NOT NULL AND n.target_department_id = $4)
+           OR (n.target_device_uid IS NULL AND n.target_department_id IS NULL)
+         )
+       ORDER BY n.sent_at DESC LIMIT $5`,
+      [device.id, device.organization_id, device_uid, device.department_id, limit]
+    );
+
+    res.json({
+      notifications: result.rows,
+      unread_count: result.rows.filter((n) => !n.is_read).length,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/agent/notifications/:id/read   (SRS-A07 FR-06)
+router.put("/notifications/:id/read", async (req, res) => {
+  const { id } = req.params;
+  const { device_uid } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await pool.query(
+      `INSERT INTO notification_reads (notification_id, device_id) VALUES ($1, $2)
+       ON CONFLICT (notification_id, device_id) DO NOTHING`,
+      [id, device.id]
+    );
+    res.json({ message: "Marked as read" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/agent/notifications/read-all   (SRS-A07 FR-07)
+router.put("/notifications/read-all", async (req, res) => {
+  const { device_uid } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query(
+      `SELECT dv.id, dv.organization_id, e.department_id
+       FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE dv.device_uid = $1`,
+      [device_uid]
+    );
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await pool.query(
+      `INSERT INTO notification_reads (notification_id, device_id)
+       SELECT n.id, $1 FROM notifications n
+       WHERE n.organization_id = $2 AND n.status = 'delivered'
+         AND (
+           n.target_device_uid = $3
+           OR (n.target_department_id IS NOT NULL AND n.target_department_id = $4)
+           OR (n.target_device_uid IS NULL AND n.target_department_id IS NULL)
+         )
+       ON CONFLICT (notification_id, device_id) DO NOTHING`,
+      [device.id, device.organization_id, device_uid, device.department_id]
+    );
+    res.json({ message: "All marked as read" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;

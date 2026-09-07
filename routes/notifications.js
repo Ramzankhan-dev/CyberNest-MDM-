@@ -44,9 +44,11 @@ async function deliverNotification(notificationId) {
       await admin.messaging().send({
         token: device.fcm_token,
         data: {
+          notification_id: String(notif.id),
           notification_message: notif.message,
           notification_title: notif.title || "",
           notification_priority: notif.priority || "Medium",
+          notification_type: notif.notification_type || "Custom Message",
         },
       });
       sentCount++;
