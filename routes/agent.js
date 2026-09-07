@@ -169,4 +169,72 @@ router.get("/policies/default", async (req, res) => {
   }
 });
 
+// POST /api/agent/sync   (SRS-A06 — manual "Sync Now")
+// Records a sync_history entry and returns what actually changed so
+// the agent can show real per-item results (not a fake progress bar).
+// Device health itself is uploaded via the existing heartbeat
+// endpoint — the agent calls that first, then this.
+router.post("/sync", async (req, res) => {
+  const { device_uid } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+  const startedAt = Date.now();
+
+  try {
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const policyResult = await pool.query(
+      `SELECT p.name FROM device_policies dp JOIN policies p ON dp.policy_id = p.id
+       WHERE dp.device_id = $1 ORDER BY dp.assigned_at DESC LIMIT 1`,
+      [device.id]
+    );
+    const policyName = policyResult.rows[0]?.name || null;
+
+    const appsResult = await pool.query("SELECT COUNT(*) FROM device_apps WHERE device_id = $1", [device.id]);
+    const appsCount = parseInt(appsResult.rows[0].count, 10);
+
+    await pool.query("UPDATE devices SET last_seen = NOW() WHERE id = $1", [device.id]);
+
+    const durationMs = Date.now() - startedAt;
+    await pool.query(
+      `INSERT INTO sync_history (device_id, status, apps_count, policy_name, duration_ms)
+       VALUES ($1, 'success', $2, $3, $4)`,
+      [device.id, appsCount, policyName, durationMs]
+    );
+
+    res.json({
+      synced_at: new Date().toISOString(),
+      policy_name: policyName,
+      apps_count: appsCount,
+      duration_ms: durationMs,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/agent/sync/history   (SRS-A06 FR-14)
+router.get("/sync/history", async (req, res) => {
+  const { device_uid, limit = 10 } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const result = await pool.query(
+      `SELECT status, apps_count, policy_name, duration_ms, synced_at
+       FROM sync_history WHERE device_id = $1 ORDER BY synced_at DESC LIMIT $2`,
+      [device.id, limit]
+    );
+    res.json({ history: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
