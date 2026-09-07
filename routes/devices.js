@@ -280,6 +280,37 @@ router.get("/:device_uid/current-policy", async (req, res) => {
   }
 });
 
+// GET /api/devices/:device_uid/policy-history   (Dashboard-facing, admin auth)
+// Every policy this device has been assigned, most recent first — the
+// first row is the currently-effective one (same one /current-policy
+// returns); the rest is assignment history for visibility.
+router.get("/:device_uid/policy-history", requireAuth, async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const deviceCheck = await pool.query("SELECT organization_id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceCheck.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+    if (!req.user.is_super_admin && device.organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.camera_blocked, p.bluetooth_blocked, p.wifi_restricted,
+              p.usb_transfer_blocked, p.kiosk_mode, dp.assigned_at
+       FROM device_policies dp
+       JOIN devices d ON dp.device_id = d.id
+       JOIN policies p ON dp.policy_id = p.id
+       WHERE d.device_uid = $1
+       ORDER BY dp.assigned_at DESC`,
+      [device_uid]
+    );
+    res.json({ history: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // POST /api/devices/:device_uid/apps   (Called by the Android agent)
 // Body: { apps: [{ package_name, app_name }, ...] }
 // Device reports its installed apps here whenever it receives a

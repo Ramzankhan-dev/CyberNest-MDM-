@@ -28,6 +28,7 @@ router.get("/dashboard", async (req, res) => {
               e.name AS employee_name,
               dept.name AS department_name,
               p.id AS policy_id, p.name AS policy_name, p.version AS policy_version,
+              p.camera_blocked, p.bluetooth_blocked, p.wifi_restricted, p.usb_transfer_blocked, p.kiosk_mode,
               dp.assigned_at
        FROM devices dv
        LEFT JOIN organizations org ON dv.organization_id = org.id
@@ -63,6 +64,13 @@ router.get("/dashboard", async (req, res) => {
       compliance_status: complianceStatus,
       policy_name: device.policy_name || null,
       policy_version: device.policy_version || null,
+      restrictions: {
+        camera_blocked: !!device.camera_blocked,
+        bluetooth_blocked: !!device.bluetooth_blocked,
+        wifi_restricted: !!device.wifi_restricted,
+        usb_transfer_blocked: !!device.usb_transfer_blocked,
+        kiosk_mode: !!device.kiosk_mode,
+      },
       last_sync: device.last_seen,
     });
   } catch (err) {
