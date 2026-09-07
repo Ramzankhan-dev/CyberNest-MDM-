@@ -359,9 +359,17 @@ router.post("/packages/:id/install", requireAuth, async (req, res) => {
     if (!device) return res.status(404).json({ error: "Device not found" });
     if (!device.fcm_token) return res.status(409).json({ error: "Device is not enrolled yet" });
 
+    const existingInstall = await pool.query(
+      "SELECT id FROM app_installs WHERE app_package_id = $1 AND device_id = $2",
+      [pkg.id, device.id]
+    );
+    if (existingInstall.rows.length > 0) {
+      return res.status(409).json({ error: `"${pkg.app_name}" is already installed on this device` });
+    }
+
     const commandLog = await pool.query(
-      `INSERT INTO commands (device_id, command_type, issued_by, status) VALUES ($1, 'install_app', $2, 'pending') RETURNING id`,
-      [device.id, req.user.id]
+      `INSERT INTO commands (device_id, command_type, issued_by, status, package_id) VALUES ($1, 'install_app', $2, 'pending', $3) RETURNING id`,
+      [device.id, req.user.id, pkg.id]
     );
 
     try {
@@ -382,6 +390,32 @@ router.post("/packages/:id/install", requireAuth, async (req, res) => {
       await pool.query("UPDATE commands SET status = 'failed', error_message = $1 WHERE id = $2", [err.message, commandLog.rows[0].id]);
       res.status(502).json({ error: "Failed to reach device" });
     }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/packages/installs   — full install history:
+// which APK, which device, which admin pushed it, and when.
+router.get("/packages/installs", requireAuth, async (req, res) => {
+  try {
+    const orgId = req.user.is_super_admin ? (req.query.organization_id || req.user.organization_id) : req.user.organization_id;
+    const result = await pool.query(
+      `SELECT ai.id, ai.installed_at,
+              ap.app_name, ap.package_name, ap.version_name,
+              dv.device_uid, dv.model AS device_model,
+              u.name AS installed_by_name
+       FROM app_installs ai
+       JOIN app_packages ap ON ai.app_package_id = ap.id
+       JOIN devices dv ON ai.device_id = dv.id
+       LEFT JOIN users u ON ai.installed_by = u.id
+       WHERE ai.organization_id = $1
+       ORDER BY ai.installed_at DESC
+       LIMIT 200`,
+      [orgId]
+    );
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

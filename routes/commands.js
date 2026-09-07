@@ -88,7 +88,22 @@ router.post("/:id/ack", async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Command not found" });
     }
-    res.json({ message: "Command acknowledged", command: result.rows[0] });
+    const command = result.rows[0];
+
+    // Successful install_app commands get logged as an actual install
+    // record — this is what powers duplicate-install prevention and
+    // the install history view.
+    if (finalStatus === "executed" && command.command_type === "install_app" && command.package_id) {
+      const deviceResult = await pool.query("SELECT organization_id FROM devices WHERE id = $1", [command.device_id]);
+      const orgId = deviceResult.rows[0]?.organization_id || null;
+      await pool.query(
+        `INSERT INTO app_installs (app_package_id, device_id, organization_id, installed_by)
+         VALUES ($1, $2, $3, $4)`,
+        [command.package_id, command.device_id, orgId, command.issued_by]
+      );
+    }
+
+    res.json({ message: "Command acknowledged", command });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
