@@ -294,4 +294,29 @@ router.get("/policy-history", async (req, res) => {
   }
 });
 
+// GET /api/agent/health   (SRS-A06 enhancement — tappable "Device
+// health reported" row on Sync screen). Same fields the heartbeat
+// endpoint receives, read back so the agent can show what was
+// actually last reported — including whether it's stale.
+router.get("/health", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const result = await pool.query(
+      `SELECT battery_level, manufacturer, model, ram_gb, storage_used_gb,
+              storage_total_gb, network_info, is_rooted, last_seen
+       FROM devices WHERE device_uid = $1`,
+      [device_uid]
+    );
+    const device = result.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    res.json(device);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
