@@ -554,4 +554,35 @@ router.get("/info", async (req, res) => {
   }
 });
 
+// GET /api/agent/apps/packages/:id/download   (Called by the Android
+// agent after an "install_app" FCM command — streams the raw APK
+// bytes for the agent to write locally and install via
+// PackageInstaller. device_uid gates access so a device can only
+// download packages belonging to its own organization.)
+router.get("/apps/packages/:id/download", async (req, res) => {
+  const { id } = req.params;
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT organization_id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const pkgResult = await pool.query(
+      "SELECT app_name, apk_data FROM app_packages WHERE id = $1 AND organization_id = $2",
+      [id, device.organization_id]
+    );
+    const pkg = pkgResult.rows[0];
+    if (!pkg) return res.status(404).json({ error: "Package not found" });
+
+    res.setHeader("Content-Type", "application/vnd.android.package-archive");
+    res.setHeader("Content-Disposition", `attachment; filename="${pkg.app_name.replace(/[^a-zA-Z0-9._-]/g, "_")}.apk"`);
+    res.send(pkg.apk_data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;

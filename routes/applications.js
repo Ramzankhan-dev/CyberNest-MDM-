@@ -1,10 +1,16 @@
 const express = require("express");
+const multer = require("multer");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
+// APKs are held in memory only long enough to write them into the
+// app_packages.apk_data column — never written to local disk (Render's
+// filesystem is ephemeral, so on-disk storage wouldn't survive a
+// redeploy anyway). 150MB covers real-world APK sizes with headroom.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 function isValidPackage(pkg) {
   return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(pkg);
@@ -256,6 +262,126 @@ router.delete("/:id", requireAuth, async (req, res) => {
 
     await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "application_deleted", status: "success", req });
     res.json({ message: "Application deleted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ===================== DIRECT APK INSTALL =====================
+// Upload an APK once, then push a silent install to any device — the
+// piece that was previously deferred (that gap was Managed Google Play
+// / package-name installs from the Play Store, which need a Google
+// Cloud enterprise account; this instead ships the APK bytes directly
+// and installs via the Device Owner's PackageInstaller API, which
+// needs nothing beyond what's already set up).
+
+// POST /api/applications/packages   (multipart: apk file + app_name, package_name, version_name)
+router.post("/packages", requireAuth, upload.single("apk"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "APK file is required" });
+    const { app_name, package_name, version_name } = req.body;
+    if (!app_name || !app_name.trim()) return res.status(400).json({ error: "App name is required" });
+    if (!package_name || !isValidPackage(package_name)) return res.status(400).json({ error: "Package name is invalid" });
+
+    const orgId = req.user.organization_id;
+    const result = await pool.query(
+      `INSERT INTO app_packages (organization_id, app_name, package_name, version_name, file_size_bytes, apk_data)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, app_name, package_name, version_name, file_size_bytes, uploaded_at`,
+      [orgId, app_name.trim(), package_name.trim(), version_name || null, req.file.size, req.file.buffer]
+    );
+
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "app_package_uploaded", status: "success", req, details: `${app_name} (${package_name})` });
+    res.status(201).json({ message: "APK uploaded", package: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/packages   — metadata only, never the blob
+router.get("/packages", requireAuth, async (req, res) => {
+  try {
+    const orgId = req.user.is_super_admin ? (req.query.organization_id || req.user.organization_id) : req.user.organization_id;
+    const result = await pool.query(
+      `SELECT id, app_name, package_name, version_name, file_size_bytes, uploaded_at
+       FROM app_packages WHERE organization_id = $1 ORDER BY uploaded_at DESC`,
+      [orgId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE /api/applications/packages/:id
+router.delete("/packages/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query("SELECT organization_id, app_name FROM app_packages WHERE id = $1", [id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Package not found" });
+    if (!req.user.is_super_admin && existing.rows[0].organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Package not found" });
+    }
+    await pool.query("DELETE FROM app_packages WHERE id = $1", [id]);
+    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "app_package_deleted", status: "success", req, details: existing.rows[0].app_name });
+    res.json({ message: "Package deleted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/applications/packages/:id/install   (body: { device_uid })
+// Sends a "install_app" FCM command carrying a download URL — the
+// device fetches the APK from GET /api/agent/apps/packages/:id/download
+// (agent-facing, in routes/agent.js) and installs it silently via
+// PackageInstaller, which Device Owner apps can do without a user
+// confirmation dialog.
+router.post("/packages/:id/install", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { device_uid } = req.body;
+    if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+    const pkgResult = await pool.query("SELECT * FROM app_packages WHERE id = $1", [id]);
+    const pkg = pkgResult.rows[0];
+    if (!pkg) return res.status(404).json({ error: "Package not found" });
+    if (!req.user.is_super_admin && pkg.organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Package not found" });
+    }
+
+    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, pkg.organization_id]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+    if (!device.fcm_token) return res.status(409).json({ error: "Device is not enrolled yet" });
+
+    const commandLog = await pool.query(
+      `INSERT INTO commands (device_id, command_type, issued_by, status) VALUES ($1, 'install_app', $2, 'pending') RETURNING id`,
+      [device.id, req.user.id]
+    );
+
+    try {
+      await admin.messaging().send({
+        token: device.fcm_token,
+        data: {
+          command: "install_app",
+          command_id: String(commandLog.rows[0].id),
+          package_id: String(pkg.id),
+          package_name: pkg.package_name,
+          app_name: pkg.app_name,
+        },
+      });
+      await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
+      await logAudit({ userId: req.user.id, organizationId: pkg.organization_id, action: "app_install_pushed", status: "success", req, details: `${pkg.app_name} -> ${device_uid}` });
+      res.json({ message: "Install command sent" });
+    } catch (err) {
+      await pool.query("UPDATE commands SET status = 'failed', error_message = $1 WHERE id = $2", [err.message, commandLog.rows[0].id]);
+      res.status(502).json({ error: "Failed to reach device" });
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
