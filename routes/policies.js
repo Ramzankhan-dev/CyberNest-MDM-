@@ -320,8 +320,19 @@ async function sendCommandToDevice(device, commandType, issuedBy, extra = {}) {
 
 function buildCommandsForPolicy(policy) {
   const commands = [];
-  if (policy.camera_blocked) commands.push({ type: "block_camera" });
-  if (policy.bluetooth_blocked) commands.push({ type: "block_bluetooth" });
+  // camera_blocked, bluetooth_blocked, and kiosk_mode are the three
+  // restrictions the dashboard labels "Working hours (kiosk/camera/
+  // bluetooth auto-toggle)" — when a schedule is set, only the
+  // on-device 30s check (HomeActivity.checkWorkingHoursAndEnforce,
+  // which uses the device's own local time) should ever turn them on
+  // or off. Pushing them immediately here too — regardless of the
+  // schedule — used to cause a visible flicker: kiosk would engage
+  // for a few seconds right on assignment, then the on-device check
+  // would notice it's outside the window and undo it a moment later.
+  const hasSchedule = !!(policy.working_hours_start && policy.working_hours_end);
+
+  if (policy.camera_blocked && !hasSchedule) commands.push({ type: "block_camera" });
+  if (policy.bluetooth_blocked && !hasSchedule) commands.push({ type: "block_bluetooth" });
   if (policy.wifi_restricted) commands.push({ type: "block_wifi" });
   if (policy.usb_transfer_blocked) commands.push({ type: "block_usb" });
   if (policy.screenshot_blocked) commands.push({ type: "block_screenshot" });
@@ -339,7 +350,7 @@ function buildCommandsForPolicy(policy) {
       commands.push({ type: "block_app", extra: { package_name: pkg } });
     });
   }
-  if (policy.kiosk_mode) commands.push({ type: "enable_kiosk", extra: policy.kiosk_package ? { package_name: policy.kiosk_package } : {} });
+  if (policy.kiosk_mode && !hasSchedule) commands.push({ type: "enable_kiosk", extra: policy.kiosk_package ? { package_name: policy.kiosk_package } : {} });
   return commands;
 }
 
