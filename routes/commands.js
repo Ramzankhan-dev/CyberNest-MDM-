@@ -22,6 +22,17 @@ async function dispatchCommand(device, commandType, issuedBy, packageName, req) 
 
     const updated = await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1 RETURNING *", [commandLog.rows[0].id]);
 
+    // "lock" is now a persistent admin-controlled lock (not just an
+    // instant screen-lock) — the device shows a freeze screen it can't
+    // escape from, even across power-button screen off/on or a reboot,
+    // until an "unlock" command arrives. Track that state here so the
+    // dashboard can show the correct toggle (Lock vs Unlock).
+    if (commandType === "lock") {
+      await pool.query("UPDATE devices SET is_locked = TRUE WHERE id = $1", [device.id]);
+    } else if (commandType === "unlock") {
+      await pool.query("UPDATE devices SET is_locked = FALSE WHERE id = $1", [device.id]);
+    }
+
     await logAudit({ userId: issuedBy, organizationId: device.organization_id, action: `command_${commandType}`, status: "success", req, details: `Device ${device.device_uid}` });
     return updated.rows[0];
   } catch (err) {
