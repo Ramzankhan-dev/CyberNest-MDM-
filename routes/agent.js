@@ -305,7 +305,8 @@ router.get("/health", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT battery_level, manufacturer, model, ram_gb, storage_used_gb,
-              storage_total_gb, network_info, is_rooted, last_seen
+              storage_total_gb, network_info, is_rooted, last_seen,
+              last_lat, last_lng, last_location_at
        FROM devices WHERE device_uid = $1`,
       [device_uid]
     );
@@ -579,6 +580,90 @@ router.get("/apps/packages/:id/download", async (req, res) => {
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
     res.setHeader("Content-Disposition", `attachment; filename="${pkg.app_name.replace(/[^a-zA-Z0-9._-]/g, "_")}.apk"`);
     res.send(pkg.apk_data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/agent/location   (Called after a "locate_device" command)
+// Body: { device_uid, lat, lng, accuracy }
+router.post("/location", async (req, res) => {
+  const { device_uid, lat, lng, accuracy } = req.body;
+  if (!device_uid || lat == null || lng == null) return res.status(400).json({ error: "device_uid, lat, and lng are required" });
+
+  try {
+    const result = await pool.query(
+      "UPDATE devices SET last_lat = $1, last_lng = $2, last_location_at = NOW() WHERE device_uid = $3 RETURNING id",
+      [lat, lng, device_uid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Device not found" });
+    res.json({ message: "Location updated" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/agent/geofence   (Device fetches its own geofence config —
+// used to (re-)register with Android's GeofencingClient, e.g. after a
+// reboot or app restart.)
+router.get("/geofence", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const result = await pool.query(
+      "SELECT geofence_enabled, geofence_lat, geofence_lng, geofence_radius_meters FROM devices WHERE device_uid = $1",
+      [device_uid]
+    );
+    const device = result.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    res.json({
+      enabled: !!device.geofence_enabled,
+      lat: device.geofence_lat,
+      lng: device.geofence_lng,
+      radius_meters: device.geofence_radius_meters,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/agent/geofence-alert   (Device reports it exited its
+// geofence — the Android GeofencingClient itself detects this; this
+// endpoint just records it so the admin has visibility.)
+router.post("/geofence-alert", async (req, res) => {
+  const { device_uid, lat, lng } = req.body;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+  try {
+    const deviceResult = await pool.query("SELECT id, organization_id, model FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await pool.query(
+      "INSERT INTO geofence_alerts (device_id, organization_id, lat, lng) VALUES ($1, $2, $3, $4)",
+      [device.id, device.organization_id, lat ?? null, lng ?? null]
+    );
+
+    // Also update last-known location — the device just reported it
+    // as part of the exit event.
+    if (lat != null && lng != null) {
+      await pool.query("UPDATE devices SET last_lat = $1, last_lng = $2, last_location_at = NOW() WHERE id = $3", [lat, lng, device.id]);
+    }
+
+    await logAudit({
+      organizationId: device.organization_id,
+      action: "geofence_exit",
+      status: "success",
+      req,
+      details: `${device.model || device_uid} left its assigned area`,
+    });
+
+    res.json({ message: "Alert recorded" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

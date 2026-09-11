@@ -377,15 +377,24 @@ router.get("/:device_uid/apps", requireAuth, async (req, res) => {
 
 // PATCH /api/devices/:device_uid/apps/:package_name/status   (Called by the Android agent)
 // Keeps the stored status in sync after a block/unblock command runs.
+// Upserts rather than plain UPDATE — an admin can block an app from the
+// catalog before the device has ever reported it via list_apps, and a
+// plain UPDATE would silently affect 0 rows in that case.
 router.patch("/:device_uid/apps/:package_name/status", async (req, res) => {
   try {
     const { device_uid, package_name } = req.params;
     const { status } = req.body;
 
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
     await pool.query(
-      `UPDATE device_apps SET status = $1, updated_at = NOW()
-       WHERE package_name = $2 AND device_id = (SELECT id FROM devices WHERE device_uid = $3)`,
-      [status, package_name, device_uid]
+      `INSERT INTO device_apps (device_id, package_name, status)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (device_id, package_name)
+       DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()`,
+      [device.id, package_name, status]
     );
 
     res.json({ message: "Status updated" });
@@ -534,6 +543,94 @@ router.delete("/:device_uid", requireAuth, async (req, res) => {
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_removed", status: "success", req, details: device_uid });
 
     res.json({ message: "Device removed" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/devices/:device_uid/geofence   (Admin only)
+// Body: { lat, lng, radius_meters }. Circular geofence only — Android's
+// native GeofencingClient supports circles directly (efficient,
+// OS-managed monitoring); a rectangular/2-point boundary would need
+// the app to manually poll GPS on its own, which is far less
+// battery-friendly and wasn't worth it for what this adds.
+router.post("/:device_uid/geofence", requireAuth, async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const { lat, lng, radius_meters } = req.body;
+    if (lat == null || lng == null || !radius_meters) {
+      return res.status(400).json({ error: "lat, lng, and radius_meters are required" });
+    }
+
+    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, req.user.organization_id]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await pool.query(
+      "UPDATE devices SET geofence_lat = $1, geofence_lng = $2, geofence_radius_meters = $3, geofence_enabled = TRUE WHERE id = $4",
+      [lat, lng, radius_meters, device.id]
+    );
+
+    if (device.fcm_token) {
+      try {
+        await admin.messaging().send({
+          token: device.fcm_token,
+          data: { command: "set_geofence", lat: String(lat), lng: String(lng), radius_meters: String(radius_meters) },
+        });
+      } catch (err) {
+        // Geofence is saved either way — device will pick it up on its
+        // next policy/heartbeat cycle even if this specific push failed.
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "geofence_set", status: "success", req, details: `${device_uid} — ${radius_meters}m radius` });
+    res.json({ message: "Geofence saved" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE /api/devices/:device_uid/geofence   (Admin only)
+router.delete("/:device_uid/geofence", requireAuth, async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, req.user.organization_id]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await pool.query("UPDATE devices SET geofence_enabled = FALSE WHERE id = $1", [device.id]);
+
+    if (device.fcm_token) {
+      try {
+        await admin.messaging().send({ token: device.fcm_token, data: { command: "clear_geofence" } });
+      } catch (err) {
+        // Same as above — state is saved regardless of push success.
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "geofence_removed", status: "success", req, details: device_uid });
+    res.json({ message: "Geofence removed" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/devices/:device_uid/geofence-alerts   (Admin only) — history
+router.get("/:device_uid/geofence-alerts", requireAuth, async (req, res) => {
+  try {
+    const { device_uid } = req.params;
+    const deviceResult = await pool.query("SELECT id FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, req.user.organization_id]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const result = await pool.query(
+      "SELECT lat, lng, triggered_at FROM geofence_alerts WHERE device_id = $1 ORDER BY triggered_at DESC LIMIT 50",
+      [device.id]
+    );
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
