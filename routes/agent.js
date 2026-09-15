@@ -330,7 +330,7 @@ router.get("/notifications", async (req, res) => {
 
   try {
     const deviceResult = await pool.query(
-      `SELECT dv.id, dv.organization_id, e.department_id
+      `SELECT dv.id, dv.organization_id, dv.enrolled_at, e.department_id
        FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
        WHERE dv.device_uid = $1`,
       [device_uid]
@@ -345,13 +345,14 @@ router.get("/notifications", async (req, res) => {
        LEFT JOIN notification_reads nr ON nr.notification_id = n.id AND nr.device_id = $1
        WHERE n.organization_id = $2
          AND n.status = 'delivered'
+         AND (n.sent_at >= $6 OR $6 IS NULL)
          AND (
            n.target_device_uid = $3
            OR (n.target_department_id IS NOT NULL AND n.target_department_id = $4)
            OR (n.target_device_uid IS NULL AND n.target_department_id IS NULL)
          )
        ORDER BY n.sent_at DESC LIMIT $5`,
-      [device.id, device.organization_id, device_uid, device.department_id, limit]
+      [device.id, device.organization_id, device_uid, device.department_id, limit, device.enrolled_at]
     );
 
     res.json({
