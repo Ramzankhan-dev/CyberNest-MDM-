@@ -2,6 +2,7 @@ const express = require("express");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
+const { getManagedDepartmentId } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 const computeStatus = require("../utils/computeCompliance");
 
@@ -10,9 +11,20 @@ const router = express.Router();
 // GET /api/compliance   (SRS-011) — one row per device that has a policy assigned
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const { search, status, department_id, page = 1, limit = 50, organization_id } = req.query;
+    const { search, status, page = 1, limit = 50, organization_id } = req.query;
+    let { department_id } = req.query;
     const orgId = req.user.is_super_admin ? organization_id : req.user.organization_id;
     if (!orgId) return res.status(400).json({ error: "organization_id is required" });
+
+    // Point 6B: a Department Manager only ever sees their own department's
+    // compliance rows — overrides whatever department_id filter the request
+    // asked for, same pattern as GET /api/devices. Not currently managing a
+    // department means nothing to show.
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId) return res.json({ compliance: [], total: 0, page: parseInt(page), limit: parseInt(limit) });
+      department_id = managedDeptId;
+    }
 
     const result = await pool.query(
       `SELECT DISTINCT ON (dv.id)
@@ -24,7 +36,7 @@ router.get("/", requireAuth, async (req, res) => {
        LEFT JOIN device_policies dp ON dp.device_id = dv.id
        LEFT JOIN policies p ON dp.policy_id = p.id
        LEFT JOIN employees e ON e.device_id = dv.id
-       LEFT JOIN departments dept ON e.department_id = dept.id
+       LEFT JOIN departments dept ON dept.id = COALESCE(dv.department_id, e.department_id)
        WHERE dv.organization_id = $1
        ORDER BY dv.id, dp.assigned_at DESC`,
       [orgId]
@@ -67,6 +79,17 @@ router.get("/summary", requireAuth, async (req, res) => {
     const orgId = req.user.is_super_admin ? req.query.organization_id : req.user.organization_id;
     if (!orgId) return res.status(400).json({ error: "organization_id is required" });
 
+    // Point 6B: same department scoping as the list endpoint above — a
+    // Department Manager's summary cards only ever count their own
+    // department's devices.
+    let managedDeptId = null;
+    if (req.user.role === "DepartmentManager") {
+      managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId) {
+        return res.json({ total_devices: 0, compliant_devices: 0, non_compliant_devices: 0, pending_sync: 0, failed_policies: 0, compliance_percentage: 0 });
+      }
+    }
+
     const result = await pool.query(
       `SELECT DISTINCT ON (dv.id)
               dv.id, dv.last_seen,
@@ -74,9 +97,11 @@ router.get("/summary", requireAuth, async (req, res) => {
        FROM devices dv
        LEFT JOIN device_policies dp ON dp.device_id = dv.id
        LEFT JOIN policies p ON dp.policy_id = p.id
+       LEFT JOIN employees e ON e.device_id = dv.id
        WHERE dv.organization_id = $1
+         ${managedDeptId ? "AND COALESCE(dv.department_id, e.department_id) = $2" : ""}
        ORDER BY dv.id, dp.assigned_at DESC`,
-      [orgId]
+      managedDeptId ? [orgId, managedDeptId] : [orgId]
     );
 
     let compliant = 0, nonCompliant = 0, pendingSync = 0, failed = 0;
