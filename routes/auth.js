@@ -176,7 +176,8 @@ router.post("/login", loginRateLimiter, async (req, res) => {
       user: {
         id: user.id, name: user.name, email: user.email, role: user.role_name || user.role,
         organization_id: user.organization_id, is_super_admin: !!user.is_super_admin,
-        organization_name: user.organization_name || null, department_name: departmentName,
+        organization_name: user.is_super_admin ? null : (user.organization_name || null),
+        department_name: departmentName,
       },
     });
   } catch (err) {

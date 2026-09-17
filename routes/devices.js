@@ -16,19 +16,10 @@ const router = express.Router();
 // Admin dashboard calls this to create a new enrollment code before
 // handing a phone to IT for provisioning. Returns a device_uid that
 // gets turned into a QR code on the frontend later.
-router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
+router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
-    const { employee_name, enrollment_profile_id } = req.body;
-    let { department_id } = req.body;
+    const { employee_name, enrollment_profile_id, department_id } = req.body;
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
-
-    // A Department Manager enrolling from within their department view
-    // always binds to their own department — they can't pick another
-    // one even if the request tried to pass a different department_id.
-    if (req.user.role === "DepartmentManager") {
-      department_id = await getManagedDepartmentId(pool, req.user.id);
-      if (!department_id) return res.status(403).json({ error: "You aren't managing a department yet" });
-    }
 
     let expiryHours = 24;
     if (enrollment_profile_id) {
