@@ -50,6 +50,11 @@ async function createOrAttachManagerAccount(pool, { employeeId, departmentId, fu
 
   await pool.query("UPDATE departments SET manager_id = $1 WHERE id = $2", [userId, departmentId]);
   await pool.query("UPDATE employees SET linked_user_id = $1 WHERE id = $2", [userId, employeeId]);
+  // Keeps the pre-existing manager_employee_id label field (set via
+  // the Departments module's own "Set Manager" UI) pointed at the
+  // same person, so the two "who manages this department" fields
+  // don't quietly diverge.
+  await pool.query("UPDATE departments SET manager_employee_id = $1 WHERE id = $2", [employeeId, departmentId]);
   return userId;
 }
 
@@ -63,6 +68,7 @@ async function detachManagerAccount(pool, employeeId) {
   if (!linkedUserId) return;
 
   await pool.query("UPDATE departments SET manager_id = NULL WHERE manager_id = $1", [linkedUserId]);
+  await pool.query("UPDATE departments SET manager_employee_id = NULL WHERE manager_employee_id = $1", [employeeId]);
   await pool.query("UPDATE users SET status = 'suspended' WHERE id = $1", [linkedUserId]);
 }
 
@@ -252,10 +258,15 @@ router.get("/", requireAuth, async (req, res) => {
     }
     if (req.user.role === "DepartmentManager") {
       // Sees only employees in the department they manage — overrides
-      // any department_id filter the request might ask for.
+      // any department_id filter the request might ask for. Also
+      // excludes their own linked employee row — a manager viewing
+      // "their team" shouldn't see themselves listed as one of their
+      // own reports.
       const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
       params.push(managedDeptId || 0); // 0 never matches a real id — an unassigned manager sees an empty list
       conditions.push(`e.department_id = $${params.length}`);
+      params.push(req.user.id);
+      conditions.push(`(e.linked_user_id IS NULL OR e.linked_user_id != $${params.length})`);
     } else if (department_id) {
       params.push(department_id);
       conditions.push(`e.department_id = $${params.length}`);
@@ -458,6 +469,7 @@ router.patch("/:id/assign-device", requireAuth, requireRole("OrganizationAdmin",
     }
 
     const result = await pool.query("UPDATE employees SET device_id = $1 WHERE id = $2 RETURNING *", [device.id, id]);
+    await pool.query("UPDATE devices SET department_id = $1 WHERE id = $2", [employee.department_id, device.id]);
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_device_assigned", status: "success", req });
     res.json({ message: "Device assigned", employee: result.rows[0] });
@@ -468,7 +480,7 @@ router.patch("/:id/assign-device", requireAuth, requireRole("OrganizationAdmin",
 });
 
 // PATCH /api/employees/:id/status   (SRS-006 FR-09) — suspend / reinstate
-router.patch("/:id/status", requireAuth, async (req, res) => {
+router.patch("/:id/status", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -482,6 +494,14 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Employee not found" });
     }
 
+    if (req.user.role === "DepartmentManager") {
+      const empResult = await pool.query("SELECT department_id FROM employees WHERE id = $1", [id]);
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || empResult.rows[0]?.department_id !== managedDeptId) {
+        return res.status(403).json({ error: "You can only manage employees in your own department" });
+      }
+    }
+
     const result = await pool.query("UPDATE employees SET status = $1 WHERE id = $2 RETURNING *", [status, id]);
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: `employee_${status}`, status: "success", req });
@@ -493,7 +513,7 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/employees/:id   (SRS-006)
-router.delete("/:id", requireAuth, async (req, res) => {
+router.delete("/:id", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const empOrgId = await getEmployeeOrgId(id);

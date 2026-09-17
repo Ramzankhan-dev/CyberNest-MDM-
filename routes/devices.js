@@ -16,10 +16,19 @@ const router = express.Router();
 // Admin dashboard calls this to create a new enrollment code before
 // handing a phone to IT for provisioning. Returns a device_uid that
 // gets turned into a QR code on the frontend later.
-router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
+router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { employee_name, enrollment_profile_id } = req.body;
+    let { department_id } = req.body;
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
+
+    // A Department Manager enrolling from within their department view
+    // always binds to their own department — they can't pick another
+    // one even if the request tried to pass a different department_id.
+    if (req.user.role === "DepartmentManager") {
+      department_id = await getManagedDepartmentId(pool, req.user.id);
+      if (!department_id) return res.status(403).json({ error: "You aren't managing a department yet" });
+    }
 
     let expiryHours = 24;
     if (enrollment_profile_id) {
@@ -33,9 +42,9 @@ router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), as
     const tokenExpiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000);
 
     const result = await pool.query(
-      `INSERT INTO devices (device_uid, employee_name, status, organization_id, enrollment_profile_id, token_expires_at)
-       VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING *`,
-      [device_uid, employee_name || null, req.user.organization_id, enrollment_profile_id || null, tokenExpiresAt]
+      `INSERT INTO devices (device_uid, employee_name, status, organization_id, enrollment_profile_id, token_expires_at, department_id)
+       VALUES ($1, $2, 'pending', $3, $4, $5, $6) RETURNING *`,
+      [device_uid, employee_name || null, req.user.organization_id, enrollment_profile_id || null, tokenExpiresAt, department_id || null]
     );
 
     res.status(201).json({ message: "Enrollment token generated", device: result.rows[0] });
@@ -129,22 +138,24 @@ router.get("/", requireAuth, async (req, res) => {
       conditions.push(`(dv.employee_name ILIKE $${params.length} OR dv.device_uid ILIKE $${params.length} OR dv.model ILIKE $${params.length} OR dv.imei ILIKE $${params.length} OR e.name ILIKE $${params.length} OR d.name ILIKE $${params.length})`);
     }
     if (req.user.role === "DepartmentManager") {
-      // A Department Manager only ever sees their own department's
-      // devices plus the org-wide unassigned pool — this overrides
-      // whatever department_id filter the request asked for, rather
-      // than trusting the client to only ever ask for their own.
+      // A Department Manager only ever sees devices bound to their own
+      // department (whether an employee has been assigned yet or not)
+      // plus the truly-global unassigned pool — never another
+      // department's still-unassigned devices. Overrides whatever
+      // department_id filter the request asked for, rather than
+      // trusting the client to only ever ask for their own.
       const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
       if (managedDeptId) {
         params.push(managedDeptId);
-        conditions.push(`(d.id = $${params.length} OR d.id IS NULL)`);
+        conditions.push(`(COALESCE(dv.department_id, e.department_id) = $${params.length} OR COALESCE(dv.department_id, e.department_id) IS NULL)`);
       } else {
-        conditions.push("d.id IS NULL"); // not managing any department yet — sees only unassigned
+        conditions.push("COALESCE(dv.department_id, e.department_id) IS NULL"); // not managing any department yet — sees only unassigned
       }
     } else if (department_id === "unassigned") {
-      conditions.push("d.id IS NULL");
+      conditions.push("COALESCE(dv.department_id, e.department_id) IS NULL");
     } else if (department_id) {
       params.push(department_id);
-      conditions.push(`d.id = $${params.length}`);
+      conditions.push(`COALESCE(dv.department_id, e.department_id) = $${params.length}`);
     }
     if (android_version) {
       params.push(android_version);
@@ -168,7 +179,7 @@ router.get("/", requireAuth, async (req, res) => {
       `SELECT dv.*, e.name AS assigned_employee_name, e.id AS assigned_employee_id, d.name AS department_name
        FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
-       LEFT JOIN departments d ON e.department_id = d.id
+       LEFT JOIN departments d ON d.id = COALESCE(dv.department_id, e.department_id)
        WHERE ${conditions.join(" AND ")}
        ORDER BY ${orderBy}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -178,7 +189,7 @@ router.get("/", requireAuth, async (req, res) => {
     const countResult = await pool.query(
       `SELECT COUNT(*) FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
-       LEFT JOIN departments d ON e.department_id = d.id
+       LEFT JOIN departments d ON d.id = COALESCE(dv.department_id, e.department_id)
        WHERE ${conditions.join(" AND ")}`,
       params.slice(0, filterParamCount)
     );
@@ -519,6 +530,11 @@ router.patch("/:device_uid/assign", requireAuth, requireRole("OrganizationAdmin"
     }
 
     await pool.query("UPDATE employees SET device_id = $1 WHERE id = $2", [device.id, employee_id]);
+    // Keeps the device's own department_id in sync with whoever it's
+    // now assigned to — the authoritative field going forward for
+    // department-scoping, rather than only resolving it indirectly
+    // through the employee link every time.
+    await pool.query("UPDATE devices SET department_id = $1 WHERE id = $2", [employee.department_id, device.id]);
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_assigned", status: "success", req, details: `${device.device_uid} -> employee ${employee_id}` });
 
     res.json({ message: "Device assigned" });

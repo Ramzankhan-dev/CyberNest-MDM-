@@ -76,7 +76,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT u.*, r.name AS role_name, o.status AS org_status FROM users u
+      `SELECT u.*, r.name AS role_name, o.status AS org_status, o.name AS organization_name FROM users u
        LEFT JOIN roles r ON u.role_id = r.id
        LEFT JOIN organizations o ON u.organization_id = o.id
        WHERE u.email = $1`,
@@ -160,6 +160,12 @@ router.post("/login", loginRateLimiter, async (req, res) => {
 
     await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_success", status: "success", req });
 
+    let departmentName = null;
+    if (user.role_name === "DepartmentManager") {
+      const deptResult = await pool.query("SELECT name FROM departments WHERE manager_id = $1", [user.id]);
+      departmentName = deptResult.rows[0]?.name || null;
+    }
+
     res.json({
       success: true,
       message: "Login successful",
@@ -167,7 +173,11 @@ router.post("/login", loginRateLimiter, async (req, res) => {
       refreshToken,
       role: user.role_name || user.role,
       organizationId: user.organization_id,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id, is_super_admin: !!user.is_super_admin },
+      user: {
+        id: user.id, name: user.name, email: user.email, role: user.role_name || user.role,
+        organization_id: user.organization_id, is_super_admin: !!user.is_super_admin,
+        organization_name: user.organization_name || null, department_name: departmentName,
+      },
     });
   } catch (err) {
     console.error(err);

@@ -22,3 +22,13 @@ END $$;
 -- when they're made a Department Manager — lets role changes cleanly
 -- find and update/detach that account later (promote/demote).
 ALTER TABLE employees ADD COLUMN IF NOT EXISTS linked_user_id INT REFERENCES users(id);
+
+-- Direct department binding on the device itself (separate from the
+-- indirect device->employee->department link). Needed so:
+-- (a) a device can be pre-bound to a department at enrollment time,
+--     before any specific employee is assigned to it, and
+-- (b) "Unassigned Devices" can distinguish truly-global unassigned
+--     (department_id IS NULL) from unassigned-but-bound-to-a-specific-
+--     department (department_id = X) — the latter should only be
+--     visible to that department's own Manager, not everyone.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS department_id INT REFERENCES departments(id);
