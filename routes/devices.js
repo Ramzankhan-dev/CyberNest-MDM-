@@ -20,6 +20,9 @@ router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), as
   try {
     const { employee_name, enrollment_profile_id, department_id } = req.body;
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
+    // "unassigned" is a frontend-only pseudo-department (the "Unassigned
+    // Devices" bucket) — it is not a real department id, so store null.
+    const resolvedDepartmentId = (department_id && department_id !== "unassigned") ? department_id : null;
 
     let expiryHours = 24;
     if (enrollment_profile_id) {
@@ -35,7 +38,7 @@ router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), as
     const result = await pool.query(
       `INSERT INTO devices (device_uid, employee_name, status, organization_id, enrollment_profile_id, token_expires_at, department_id)
        VALUES ($1, $2, 'pending', $3, $4, $5, $6) RETURNING *`,
-      [device_uid, employee_name || null, req.user.organization_id, enrollment_profile_id || null, tokenExpiresAt, department_id || null]
+      [device_uid, employee_name || null, req.user.organization_id, enrollment_profile_id || null, tokenExpiresAt, resolvedDepartmentId]
     );
 
     res.status(201).json({ message: "Enrollment token generated", device: result.rows[0] });
