@@ -230,12 +230,22 @@ router.get("/me", requireAuth, async (req, res) => {
     const deptCount = await pool.query("SELECT COUNT(*) FROM departments WHERE organization_id = $1", [org.id]);
     const deviceCount = await pool.query("SELECT COUNT(*) FROM devices WHERE organization_id = $1", [org.id]);
     const adminCount = await pool.query("SELECT COUNT(*) FROM users WHERE organization_id = $1", [org.id]);
+    const employeeCount = await pool.query(
+      "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1",
+      [org.id]
+    );
+    const managerCount = await pool.query(
+      "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1 AND e.role = 'DepartmentManager'",
+      [org.id]
+    );
 
     res.json({
       ...org,
       department_count: parseInt(deptCount.rows[0].count),
       device_count: parseInt(deviceCount.rows[0].count),
       admin_count: parseInt(adminCount.rows[0].count),
+      employee_count: parseInt(employeeCount.rows[0].count),
+      manager_count: parseInt(managerCount.rows[0].count),
     });
   } catch (err) {
     console.error(err);
