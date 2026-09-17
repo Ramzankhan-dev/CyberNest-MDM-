@@ -2,12 +2,42 @@ const express = require("express");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
+const { getManagedDepartmentId } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
 
 const VALID_TYPES = ["Announcement", "Security Alert", "Policy Update", "Maintenance Notice", "Emergency Alert", "Custom Message"];
 const VALID_PRIORITIES = ["Low", "Medium", "High", "Critical"];
+
+// Point 6C: a Department Manager's notifications never leave their own
+// department. Called right after validation, before either send/schedule
+// inserts a row — rewrites the resolved target in place so every path
+// downstream (delivery, audit log, history table) sees the already-scoped
+// values, rather than trusting the client to only ever ask for its own
+// department. Returns an error string to send back, or null if OK to proceed.
+async function scopeTargetToOwnDepartment(req, target) {
+  if (req.user.role !== "DepartmentManager") return null;
+
+  const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+  if (!managedDeptId) return "You are not currently managing a department";
+
+  if (target.target_device_uid) {
+    // A device-level target must still belong to the manager's own department.
+    const check = await pool.query(
+      `SELECT 1 FROM devices d LEFT JOIN employees e ON e.device_id = d.id
+       WHERE d.device_uid = $1 AND d.organization_id = $2 AND COALESCE(d.department_id, e.department_id) = $3`,
+      [target.target_device_uid, req.user.organization_id, managedDeptId]
+    );
+    if (check.rows.length === 0) return "You can only notify devices in your own department";
+    target.target_department_id = null; // device_uid takes precedence in resolveTargetDevices — keep it unambiguous
+  } else {
+    // No device picked — whatever department (or "everyone") was requested,
+    // a manager's broadcast always resolves to their own department only.
+    target.target_department_id = managedDeptId;
+  }
+  return null;
+}
 
 // Resolves the device list for a given target, shared by send/resend/scheduler
 async function resolveTargetDevices(organizationId, targetDeviceUid, targetDepartmentId) {
@@ -84,16 +114,20 @@ setInterval(async () => {
 // POST /api/notifications/send   (SRS-014 FR-01/02/03) — send immediately
 router.post("/send", requireAuth, async (req, res) => {
   try {
-    const { title, message, notification_type, priority, target_device_uid, target_department_id } = req.body;
+    const { title, message, notification_type, priority } = req.body;
+    const target = { target_device_uid: req.body.target_device_uid || null, target_department_id: req.body.target_department_id || null };
     if (!title || !title.trim()) return res.status(400).json({ error: "Notification title is required" });
     if (!message || !message.trim()) return res.status(400).json({ error: "Notification message is required" });
     if (notification_type && !VALID_TYPES.includes(notification_type)) return res.status(400).json({ error: "Invalid notification type" });
     if (priority && !VALID_PRIORITIES.includes(priority)) return res.status(400).json({ error: "Invalid priority" });
 
+    const scopeError = await scopeTargetToOwnDepartment(req, target);
+    if (scopeError) return res.status(403).json({ error: scopeError });
+
     const insertResult = await pool.query(
       `INSERT INTO notifications (title, message, notification_type, priority, target_device_uid, target_department_id, sent_by, sent_by_name, organization_id, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'sending') RETURNING *`,
-      [title.trim(), message.trim(), notification_type || "Custom Message", priority || "Medium", target_device_uid || null, target_department_id || null, req.user.id, req.user.email, req.user.organization_id]
+      [title.trim(), message.trim(), notification_type || "Custom Message", priority || "Medium", target.target_device_uid, target.target_department_id, req.user.id, req.user.email, req.user.organization_id]
     );
     const notif = insertResult.rows[0];
 
@@ -111,16 +145,20 @@ router.post("/send", requireAuth, async (req, res) => {
 // POST /api/notifications/schedule   (SRS-014 FR-04)
 router.post("/schedule", requireAuth, async (req, res) => {
   try {
-    const { title, message, notification_type, priority, target_device_uid, target_department_id, scheduled_at } = req.body;
+    const { title, message, notification_type, priority, scheduled_at } = req.body;
+    const target = { target_device_uid: req.body.target_device_uid || null, target_department_id: req.body.target_department_id || null };
     if (!title || !title.trim()) return res.status(400).json({ error: "Notification title is required" });
     if (!message || !message.trim()) return res.status(400).json({ error: "Notification message is required" });
     if (!scheduled_at) return res.status(400).json({ error: "scheduled_at is required" });
     if (new Date(scheduled_at) <= new Date()) return res.status(400).json({ error: "Schedule time must be in the future" });
 
+    const scopeError = await scopeTargetToOwnDepartment(req, target);
+    if (scopeError) return res.status(403).json({ error: scopeError });
+
     const result = await pool.query(
       `INSERT INTO notifications (title, message, notification_type, priority, target_device_uid, target_department_id, sent_by, sent_by_name, organization_id, scheduled_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'scheduled') RETURNING *`,
-      [title.trim(), message.trim(), notification_type || "Custom Message", priority || "Medium", target_device_uid || null, target_department_id || null, req.user.id, req.user.email, req.user.organization_id, scheduled_at]
+      [title.trim(), message.trim(), notification_type || "Custom Message", priority || "Medium", target.target_device_uid, target.target_department_id, req.user.id, req.user.email, req.user.organization_id, scheduled_at]
     );
 
     await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "notification_scheduled", status: "success", req, details: title });
