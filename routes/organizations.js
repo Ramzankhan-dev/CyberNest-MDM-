@@ -231,7 +231,7 @@ router.get("/me", requireAuth, async (req, res) => {
     const deviceCount = await pool.query("SELECT COUNT(*) FROM devices WHERE organization_id = $1", [org.id]);
     const adminCount = await pool.query("SELECT COUNT(*) FROM users WHERE organization_id = $1", [org.id]);
     const employeeCount = await pool.query(
-      "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1",
+      "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1 AND e.role = 'Employee'",
       [org.id]
     );
     const managerCount = await pool.query(
