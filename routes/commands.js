@@ -2,6 +2,8 @@ const express = require("express");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
+const requireRole = require("../middleware/roles");
+const { getManagedDepartmentId } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -45,7 +47,7 @@ async function dispatchCommand(device, commandType, issuedBy, packageName, req) 
 
 // POST /api/commands/send   (Admin only) — FR-01: supports one or many devices
 // Body: { device_uid: "..." } OR { device_uids: ["...", "..."] }, command_type, package_name?
-router.post("/send", requireAuth, async (req, res) => {
+router.post("/send", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { device_uid, device_uids, command_type, package_name } = req.body;
     const targets = device_uids && Array.isArray(device_uids) ? device_uids : device_uid ? [device_uid] : [];
@@ -53,12 +55,23 @@ router.post("/send", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "device_uid(s) and command_type are required" });
     }
 
+    const managedDeptId = req.user.role === "DepartmentManager" ? await getManagedDepartmentId(pool, req.user.id) : null;
+
     const results = [];
     for (const uid of targets) {
-      const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [uid, req.user.organization_id]);
+      const deviceResult = await pool.query(
+        `SELECT dv.*, e.department_id AS employee_department_id FROM devices dv
+         LEFT JOIN employees e ON e.device_id = dv.id
+         WHERE dv.device_uid = $1 AND dv.organization_id = $2`,
+        [uid, req.user.organization_id]
+      );
       const device = deviceResult.rows[0];
       if (!device) {
         results.push({ device_uid: uid, error: "Selected device does not exist" });
+        continue;
+      }
+      if (req.user.role === "DepartmentManager" && (!managedDeptId || device.employee_department_id !== managedDeptId)) {
+        results.push({ device_uid: uid, error: "You can only manage devices in your own department" });
         continue;
       }
       if (!device.fcm_token) {

@@ -2,6 +2,8 @@ const express = require("express");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
+const requireRole = require("../middleware/roles");
+const { getManagedDepartmentId } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -31,10 +33,10 @@ async function snapshotVersion(policyId, userId) {
 }
 
 // POST /api/policies   (SRS-009 FR-01)
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
     const { name, policy_code, description, organization_id } = req.body;
-    const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
+    const orgId = req.user.organization_id;
 
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Policy name is required" });
@@ -379,7 +381,7 @@ function buildUnblockCommandsForPolicy(policy) {
 }
 
 // POST /api/policies/:id/assign   (SRS-009 FR-04) — assign to one device
-router.post("/:id/assign", requireAuth, async (req, res) => {
+router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { id } = req.params;
     const { device_uid } = req.body;
@@ -389,10 +391,24 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     const policy = policyResult.rows[0];
     if (!policy) return res.status(404).json({ error: "Policy not found" });
 
-    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, policy.organization_id]);
+    const deviceResult = await pool.query(
+      `SELECT dv.*, e.department_id AS employee_department_id FROM devices dv
+       LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE dv.device_uid = $1 AND dv.organization_id = $2`,
+      [device_uid, policy.organization_id]
+    );
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Selected device does not exist" });
     if (!device.fcm_token) return res.status(400).json({ error: "This device has no FCM token yet" });
+
+    // Department Managers can only apply policies to devices held by
+    // an employee in the department they manage.
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || device.employee_department_id !== managedDeptId) {
+        return res.status(403).json({ error: "You can only manage devices in your own department" });
+      }
+    }
 
     const commands = buildCommandsForPolicy(policy);
     for (const cmd of commands) {
@@ -411,11 +427,18 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
 
 // POST /api/policies/:id/assign-department   (SRS-009 FR-04) — assign to every
 // device currently held by employees in a department
-router.post("/:id/assign-department", requireAuth, async (req, res) => {
+router.post("/:id/assign-department", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { id } = req.params;
     const { department_id } = req.body;
     if (!department_id) return res.status(400).json({ error: "Select at least one device or department" });
+
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || Number(department_id) !== managedDeptId) {
+        return res.status(403).json({ error: "You can only manage your own department" });
+      }
+    }
 
     const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
     const policy = policyResult.rows[0];

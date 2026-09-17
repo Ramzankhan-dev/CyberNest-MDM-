@@ -66,7 +66,7 @@ router.post("/register", async (req, res) => {
 // ===================== LOGIN (SRS-001) =====================
 router.post("/login", loginRateLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, selected_role } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required" });
@@ -87,6 +87,17 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     if (!user) {
       await logAudit({ action: "login_failed", status: "failure", req, details: `No account for ${email}` });
       return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    // The Login screen's role dropdown is a UX convenience (routes the
+    // person to the right portal view) — it is NOT the source of
+    // truth for authorization. The account's own role_name (set by an
+    // Organization Admin, or is_super_admin for platform owners) is
+    // what's actually trusted; a mismatched selection is rejected
+    // outright rather than silently using either value.
+    if (selected_role && user.role_name !== selected_role) {
+      await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: `Role mismatch: selected ${selected_role}, account is ${user.role_name}` });
+      return res.status(401).json({ error: `This account is not a ${selected_role.replace(/([A-Z])/g, " $1").trim()}` });
     }
 
     if (user.status === "suspended") {

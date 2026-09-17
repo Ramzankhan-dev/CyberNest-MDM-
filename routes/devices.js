@@ -2,17 +2,21 @@ const express = require("express");
 const crypto = require("crypto");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const requireRole = require("../middleware/roles");
+const { getManagedDepartmentId } = require("../middleware/roles");
 
 const logAudit = require("../utils/auditLog");
 const admin = require("../config/firebase");
 
 const router = express.Router();
 
-// POST /api/devices/generate-token   (Admin only)
+// POST /api/devices/generate-token   (Organization Admin only —
+// Department Managers may link an existing unassigned device to an
+// employee in their department, but may not create new devices)
 // Admin dashboard calls this to create a new enrollment code before
 // handing a phone to IT for provisioning. Returns a device_uid that
 // gets turned into a QR code on the frontend later.
-router.post("/generate-token", requireAuth, async (req, res) => {
+router.post("/generate-token", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
     const { employee_name, enrollment_profile_id } = req.body;
     const device_uid = crypto.randomBytes(8).toString("hex"); // e.g. "a1b2c3d4e5f6a7b8"
@@ -124,7 +128,19 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(`%${search}%`);
       conditions.push(`(dv.employee_name ILIKE $${params.length} OR dv.device_uid ILIKE $${params.length} OR dv.model ILIKE $${params.length} OR dv.imei ILIKE $${params.length} OR e.name ILIKE $${params.length} OR d.name ILIKE $${params.length})`);
     }
-    if (department_id === "unassigned") {
+    if (req.user.role === "DepartmentManager") {
+      // A Department Manager only ever sees their own department's
+      // devices plus the org-wide unassigned pool — this overrides
+      // whatever department_id filter the request asked for, rather
+      // than trusting the client to only ever ask for their own.
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (managedDeptId) {
+        params.push(managedDeptId);
+        conditions.push(`(d.id = $${params.length} OR d.id IS NULL)`);
+      } else {
+        conditions.push("d.id IS NULL"); // not managing any department yet — sees only unassigned
+      }
+    } else if (department_id === "unassigned") {
       conditions.push("d.id IS NULL");
     } else if (department_id) {
       params.push(department_id);
@@ -467,7 +483,7 @@ router.delete("/:device_uid/policy", requireAuth, async (req, res) => {
 // PATCH /api/devices/:device_uid/assign   (SRS-007 FR-09)
 // Assigns this device to an employee — the reciprocal of the Employees
 // module's "assign device to employee" action.
-router.patch("/:device_uid/assign", requireAuth, async (req, res) => {
+router.patch("/:device_uid/assign", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { device_uid } = req.params;
     const { employee_id } = req.body;
@@ -486,6 +502,15 @@ router.patch("/:device_uid/assign", requireAuth, async (req, res) => {
     const employee = empResult.rows[0];
     if (!employee) return res.status(400).json({ error: "Assigned employee must belong to the same organization" });
     if (employee.status === "suspended") return res.status(409).json({ error: "Cannot assign a device to a suspended employee" });
+
+    // A Department Manager may only link a device to an employee
+    // within the department they manage.
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || employee.department_id !== managedDeptId) {
+        return res.status(403).json({ error: "You can only assign devices to employees in your own department" });
+      }
+    }
 
     // BR-02: one device can be assigned to only one employee at a time
     const alreadyAssigned = await pool.query("SELECT id FROM employees WHERE device_id = $1 AND id != $2", [device.id, employee_id]);

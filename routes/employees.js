@@ -2,12 +2,69 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const requireRole = require("../middleware/roles");
+const { getManagedDepartmentId } = require("../middleware/roles");
 const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
 
 const ALLOWED_ROLES = ["OrganizationAdmin", "DepartmentManager", "Employee"];
+
+// Creates (or re-suspends-then-reuses, if one already exists from a
+// prior promotion) the dashboard-login "users" account for an
+// employee being made a Department Manager, and points
+// departments.manager_id / employees.linked_user_id at it. Enforces
+// the 1:1 department<->manager constraint at the application level
+// too (clearer error message than letting the DB UNIQUE constraint
+// reject it).
+async function createOrAttachManagerAccount(pool, { employeeId, departmentId, fullName, email, password, organizationId }) {
+  const existingManager = await pool.query("SELECT manager_id FROM departments WHERE id = $1", [departmentId]);
+  const currentManagerId = existingManager.rows[0]?.manager_id;
+
+  const employeeRow = await pool.query("SELECT linked_user_id FROM employees WHERE id = $1", [employeeId]);
+  const alreadyLinkedUserId = employeeRow.rows[0]?.linked_user_id;
+
+  if (currentManagerId && currentManagerId !== alreadyLinkedUserId) {
+    throw new Error("This department already has a Department Manager — remove them first");
+  }
+
+  const roleResult = await pool.query("SELECT id FROM roles WHERE name = 'DepartmentManager'");
+  const roleId = roleResult.rows[0]?.id;
+  if (!roleId) throw new Error("DepartmentManager role is not configured");
+
+  let userId = alreadyLinkedUserId;
+  if (userId) {
+    // Re-activating a previously-demoted manager account.
+    await pool.query("UPDATE users SET status = 'active', name = $1, role_id = $2 WHERE id = $3", [fullName, roleId, userId]);
+  } else {
+    if (!password || password.length < 8) throw new Error("A password (min 8 characters) is required to create a Department Manager account");
+    const passwordHash = await bcrypt.hash(password, 10);
+    const insertResult = await pool.query(
+      `INSERT INTO users (name, email, password_hash, organization_id, role, role_id, status)
+       VALUES ($1, $2, $3, $4, 'department_manager', $5, 'active') RETURNING id`,
+      [fullName, email, passwordHash, organizationId, roleId]
+    );
+    userId = insertResult.rows[0].id;
+  }
+
+  await pool.query("UPDATE departments SET manager_id = $1 WHERE id = $2", [userId, departmentId]);
+  await pool.query("UPDATE employees SET linked_user_id = $1 WHERE id = $2", [userId, employeeId]);
+  return userId;
+}
+
+// Called when an employee is demoted away from DepartmentManager —
+// detaches them from the department they managed and suspends their
+// dashboard account (rather than deleting it, to keep audit_log /
+// other references intact).
+async function detachManagerAccount(pool, employeeId) {
+  const employeeRow = await pool.query("SELECT linked_user_id FROM employees WHERE id = $1", [employeeId]);
+  const linkedUserId = employeeRow.rows[0]?.linked_user_id;
+  if (!linkedUserId) return;
+
+  await pool.query("UPDATE departments SET manager_id = NULL WHERE manager_id = $1", [linkedUserId]);
+  await pool.query("UPDATE users SET status = 'suspended' WHERE id = $1", [linkedUserId]);
+}
 
 // GET /api/employees/profile   (SRS-A04 FR-07/FR-08 — called by the
 // Android agent right after employee-login, with the employee's own
@@ -96,9 +153,9 @@ router.patch("/:id/set-password", requireAuth, async (req, res) => {
 });
 
 // POST /api/employees   (SRS-006)
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
-    const { employee_code, first_name, last_name, email, phone_number, department_id, designation, role, status } = req.body;
+    const { employee_code, first_name, last_name, email, phone_number, department_id, designation, role, status, password } = req.body;
 
     if (!employee_code || employee_code.length > 20) {
       return res.status(400).json({ error: "Employee ID is required (max 20 characters)" });
@@ -149,6 +206,25 @@ router.post("/", requireAuth, async (req, res) => {
       [department_id, fullName, employee_code, email, phone_number || null, designation || null, role || "Employee", status || "active"]
     );
 
+    if (role === "DepartmentManager") {
+      try {
+        await createOrAttachManagerAccount(pool, {
+          employeeId: result.rows[0].id,
+          departmentId: department_id,
+          fullName,
+          email,
+          password,
+          organizationId: orgId,
+        });
+      } catch (managerErr) {
+        // The employee row is already created — roll that back too,
+        // rather than leaving an Employee record with a DepartmentManager
+        // label but no working dashboard account behind it.
+        await pool.query("DELETE FROM employees WHERE id = $1", [result.rows[0].id]);
+        return res.status(400).json({ error: managerErr.message });
+      }
+    }
+
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "employee_created", status: "success", req, details: fullName });
     res.status(201).json({ message: "Employee added", employee: result.rows[0] });
   } catch (err) {
@@ -174,7 +250,13 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(`%${search}%`);
       conditions.push(`(e.name ILIKE $${params.length} OR e.employee_code ILIKE $${params.length} OR e.email ILIKE $${params.length} OR e.phone_number ILIKE $${params.length})`);
     }
-    if (department_id) {
+    if (req.user.role === "DepartmentManager") {
+      // Sees only employees in the department they manage — overrides
+      // any department_id filter the request might ask for.
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      params.push(managedDeptId || 0); // 0 never matches a real id — an unassigned manager sees an empty list
+      conditions.push(`e.department_id = $${params.length}`);
+    } else if (department_id) {
       params.push(department_id);
       conditions.push(`e.department_id = $${params.length}`);
     }
@@ -285,10 +367,10 @@ router.patch("/:id/department", requireAuth, async (req, res) => {
 });
 
 // PATCH /api/employees/:id/role   (SRS-006 FR-08)
-router.patch("/:id/role", requireAuth, async (req, res) => {
+router.patch("/:id/role", requireAuth, requireRole("OrganizationAdmin"), async (req, res) => {
   try {
     const { id } = req.params;
-    const { role } = req.body;
+    const { role, password } = req.body;
     if (!ALLOWED_ROLES.includes(role)) {
       return res.status(400).json({ error: "Role must be OrganizationAdmin, DepartmentManager, or Employee" });
     }
@@ -297,6 +379,27 @@ router.patch("/:id/role", requireAuth, async (req, res) => {
     if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
     if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const currentResult = await pool.query("SELECT * FROM employees WHERE id = $1", [id]);
+    const current = currentResult.rows[0];
+
+    if (current.role === "DepartmentManager" && role !== "DepartmentManager") {
+      await detachManagerAccount(pool, id);
+    }
+    if (role === "DepartmentManager" && current.role !== "DepartmentManager") {
+      try {
+        await createOrAttachManagerAccount(pool, {
+          employeeId: id,
+          departmentId: current.department_id,
+          fullName: current.name,
+          email: current.email,
+          password,
+          organizationId: empOrgId,
+        });
+      } catch (managerErr) {
+        return res.status(400).json({ error: managerErr.message });
+      }
     }
 
     const result = await pool.query("UPDATE employees SET role = $1 WHERE id = $2 RETURNING *", [role, id]);
@@ -310,7 +413,7 @@ router.patch("/:id/role", requireAuth, async (req, res) => {
 });
 
 // PATCH /api/employees/:id/assign-device   (SRS-006 FR-06, BR-03/04/05)
-router.patch("/:id/assign-device", requireAuth, async (req, res) => {
+router.patch("/:id/assign-device", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
     const { id } = req.params;
     const { device_uid } = req.body;
@@ -326,6 +429,13 @@ router.patch("/:id/assign-device", requireAuth, async (req, res) => {
 
     const empResult = await pool.query("SELECT * FROM employees WHERE id = $1", [id]);
     const employee = empResult.rows[0];
+
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || employee.department_id !== managedDeptId) {
+        return res.status(403).json({ error: "You can only assign devices to employees in your own department" });
+      }
+    }
 
     // BR-05: suspended employees cannot receive new device assignments
     if (employee.status === "suspended") {
