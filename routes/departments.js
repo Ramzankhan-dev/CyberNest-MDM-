@@ -86,9 +86,8 @@ router.get("/", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT d.*, p.name AS policy_name, mgr.name AS manager_name,
               (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id) AS employee_count,
-              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.device_id IS NOT NULL) AS device_count,
-              (SELECT COUNT(*) FROM employees e JOIN devices dv ON e.device_id = dv.id
-                WHERE e.department_id = d.id AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
+              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id) AS device_count,
+              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
        FROM departments d
        LEFT JOIN policies p ON d.default_policy_id = p.id
        LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id

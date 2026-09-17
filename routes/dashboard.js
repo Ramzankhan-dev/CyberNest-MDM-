@@ -141,8 +141,8 @@ router.get("/charts", requireAuth, async (req, res) => {
       deviceDistribution = [{ department: "Your department", count: devices.length }];
     } else {
       const deptResult = await pool.query(
-        `SELECT dep.name, COUNT(e.id) AS device_count FROM departments dep
-         LEFT JOIN employees e ON e.department_id = dep.id AND e.device_id IS NOT NULL
+        `SELECT dep.name, COUNT(dv.id) AS device_count FROM departments dep
+         LEFT JOIN devices dv ON dv.department_id = dep.id
          WHERE dep.organization_id = $1 GROUP BY dep.name`,
         [req.user.organization_id]
       );
