@@ -26,15 +26,72 @@ function moduleForAction(action) {
 
 const MODULES = ["Authentication", "Device", "Policy", "Command", "Application", "Employee", "Department", "Organization", "Notification", "Compliance", "Enrollment", "Dashboard", "Other"];
 
+// Turns a row's joined role/department info into the label shown next
+// to the user's name in the dashboard (e.g. "Super Admin",
+// "Organization Admin", "Manager - Sales"). Rows with no linked user
+// (system events, failed logins before the account was found) get no
+// badge at all.
+function roleBadge(row) {
+  if (row.user_role === "SuperAdmin") return "Super Admin";
+  if (row.user_role === "OrganizationAdmin") return "Organization Admin";
+  if (row.user_role === "DepartmentManager") return `Manager - ${row.managed_department_name || "Unassigned"}`;
+  return null;
+}
+
+// Builds the role-tier WHERE clause (+ matching params) shared by both
+// GET / and GET /stats, so the log list and the KPI cards above it are
+// always looking at the exact same slice of audit_logs:
+//
+//   SuperAdmin        — their own activity, everywhere, PLUS every
+//                        Organization Admin's activity across every
+//                        org. Department Manager rows are excluded.
+//                        An optional organization_id further narrows
+//                        the Organization Admin half to one org (the
+//                        SuperAdmin's own rows are unaffected by it).
+//   OrganizationAdmin — their own activity PLUS every Department
+//                        Manager's activity, scoped to their own
+//                        organization only.
+//   anything else      — the Audit Logs page isn't exposed to any
+//                        other role in the UI, so the API denies it
+//                        too rather than silently returning nothing.
+//
+// Requires the query to LEFT JOIN roles r ON u.role_id = r.id (u being
+// the LEFT JOIN'd users row) — r.name is what the OR conditions below
+// match against.
+function buildTierFilter(req, organizationIdParam) {
+  const conditions = [];
+  const params = [];
+
+  if (req.user.is_super_admin) {
+    params.push(req.user.id);
+    conditions.push(`(al.user_id = $${params.length} OR r.name = 'OrganizationAdmin')`);
+    if (organizationIdParam) {
+      params.push(organizationIdParam);
+      conditions.push(`al.organization_id = $${params.length}`);
+    }
+  } else if (req.user.role === "OrganizationAdmin") {
+    if (!req.user.organization_id) return null;
+    params.push(req.user.organization_id);
+    conditions.push(`al.organization_id = $${params.length}`);
+    params.push(req.user.id);
+    conditions.push(`(al.user_id = $${params.length} OR r.name = 'DepartmentManager')`);
+  } else {
+    return null;
+  }
+
+  return { conditions, params };
+}
+
 // GET /api/audit-logs   (SRS-016) — search, filter, pagination
 router.get("/", requireAuth, async (req, res) => {
   try {
     const { search, module: moduleFilter, status, date_from, date_to, page = 1, limit = 50, organization_id } = req.query;
-    const orgId = req.user.is_super_admin ? organization_id : req.user.organization_id;
-    if (!orgId) return res.status(400).json({ error: "organization_id is required" });
 
-    const conditions = ["al.organization_id = $1"];
-    const params = [orgId];
+    const tier = buildTierFilter(req, organization_id);
+    if (!tier) return res.status(403).json({ error: "You don't have permission to view audit logs" });
+
+    const conditions = [...tier.conditions];
+    const params = [...tier.params];
 
     if (search) {
       params.push(`%${search}%`);
@@ -58,20 +115,28 @@ router.get("/", requireAuth, async (req, res) => {
     params.push(parseInt(limit) * 3, offset); // fetch extra since module filter is applied in JS
 
     const result = await pool.query(
-      `SELECT al.*, u.name AS user_name, u.email AS user_email
+      `SELECT al.*, u.name AS user_name, u.email AS user_email, r.name AS user_role, d.name AS managed_department_name
        FROM audit_logs al
        LEFT JOIN users u ON al.user_id = u.id
+       LEFT JOIN roles r ON u.role_id = r.id
+       LEFT JOIN departments d ON d.manager_id = u.id
        WHERE ${conditions.join(" AND ")}
        ORDER BY al.created_at DESC
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
 
-    let rows = result.rows.map((r) => ({ ...r, module: moduleForAction(r.action) }));
+    let rows = result.rows.map((r) => ({ ...r, module: moduleForAction(r.action), role_badge: roleBadge(r) }));
     if (moduleFilter) rows = rows.filter((r) => r.module === moduleFilter);
     rows = rows.slice(0, parseInt(limit));
 
-    const countResult = await pool.query(`SELECT COUNT(*) FROM audit_logs al LEFT JOIN users u ON al.user_id = u.id WHERE ${conditions.join(" AND ")}`, params.slice(0, filterParamCount));
+    const countResult = await pool.query(
+      `SELECT COUNT(*) FROM audit_logs al
+       LEFT JOIN users u ON al.user_id = u.id
+       LEFT JOIN roles r ON u.role_id = r.id
+       WHERE ${conditions.join(" AND ")}`,
+      params.slice(0, filterParamCount)
+    );
 
     res.json({ logs: rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit: parseInt(limit), modules: MODULES });
   } catch (err) {
@@ -83,10 +148,17 @@ router.get("/", requireAuth, async (req, res) => {
 // GET /api/audit-logs/stats   (SRS-016) — the 6 dashboard cards
 router.get("/stats", requireAuth, async (req, res) => {
   try {
-    const orgId = req.user.is_super_admin ? req.query.organization_id : req.user.organization_id;
-    if (!orgId) return res.status(400).json({ error: "organization_id is required" });
+    const tier = buildTierFilter(req, req.query.organization_id);
+    if (!tier) return res.status(403).json({ error: "You don't have permission to view audit logs" });
 
-    const all = await pool.query("SELECT action, status FROM audit_logs WHERE organization_id = $1", [orgId]);
+    const all = await pool.query(
+      `SELECT al.action, al.status
+       FROM audit_logs al
+       LEFT JOIN users u ON al.user_id = u.id
+       LEFT JOIN roles r ON u.role_id = r.id
+       WHERE ${tier.conditions.join(" AND ")}`,
+      tier.params
+    );
     let total = all.rows.length, login = 0, policyChanges = 0, commands = 0, failed = 0, critical = 0;
 
     all.rows.forEach((r) => {
