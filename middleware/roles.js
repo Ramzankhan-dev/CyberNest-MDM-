@@ -37,5 +37,22 @@ async function getManagedDepartmentId(pool, userId) {
   return result.rows[0]?.id || null;
 }
 
+// Explicit write-block for Super Admin. SuperAdmin has read-only
+// visibility into every organization's Departments, Employees,
+// Policies, and Devices — they can view everything but must never be
+// able to create/edit/suspend/delete/command anything at the
+// organization level (that's OrganizationAdmin's and, scoped to their
+// own department, DepartmentManager's job). Apply this to every
+// POST/PUT/PATCH/DELETE route in those four modules that isn't
+// already restricted to a specific non-SuperAdmin role via
+// requireRole(). Must run after requireAuth.
+function blockSuperAdmin(req, res, next) {
+  if (req.user && req.user.is_super_admin) {
+    return res.status(403).json({ error: "Super Admin has read-only access to this module" });
+  }
+  next();
+}
+
 module.exports = requireRole;
 module.exports.getManagedDepartmentId = getManagedDepartmentId;
+module.exports.blockSuperAdmin = blockSuperAdmin;

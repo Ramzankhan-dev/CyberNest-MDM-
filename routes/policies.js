@@ -3,7 +3,7 @@ const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/roles");
-const { getManagedDepartmentId } = require("../middleware/roles");
+const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -140,13 +140,13 @@ router.get("/:id/versions", requireAuth, async (req, res) => {
 });
 
 // PUT /api/policies/:id   (SRS-009) — BR-03: updates create a new version
-router.put("/:id", requireAuth, async (req, res) => {
+router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const existing = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
     const policy = existing.rows[0];
-    if (!req.user.is_super_admin && policy.organization_id !== req.user.organization_id) {
+    if (policy.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Policy not found" });
     }
 
@@ -183,7 +183,7 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 // POST /api/policies/:id/duplicate   (SRS-009 FR-03)
-router.post("/:id/duplicate", requireAuth, async (req, res) => {
+router.post("/:id/duplicate", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const existing = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
@@ -217,7 +217,7 @@ router.post("/:id/duplicate", requireAuth, async (req, res) => {
 });
 
 // PATCH /api/policies/:id/status   (SRS-009 FR-08)
-router.patch("/:id/status", requireAuth, async (req, res) => {
+router.patch("/:id/status", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -237,7 +237,7 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 // DELETE /api/policies/:id/unassign   (removes this policy's device assignments)
 // Genuinely reverses the policy on each device — sends the matching
 // unblock_* commands — then clears the assignment record.
-router.delete("/:id/unassign", requireAuth, async (req, res) => {
+router.delete("/:id/unassign", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
@@ -272,7 +272,7 @@ router.delete("/:id/unassign", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/policies/:id   (SRS-009 BR-05)
-router.delete("/:id", requireAuth, async (req, res) => {
+router.delete("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const assigned = await pool.query("SELECT COUNT(*) FROM device_policies WHERE policy_id = $1", [id]);

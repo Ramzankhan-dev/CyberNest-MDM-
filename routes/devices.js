@@ -3,7 +3,7 @@ const crypto = require("crypto");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/roles");
-const { getManagedDepartmentId } = require("../middleware/roles");
+const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 
 const logAudit = require("../utils/auditLog");
 const admin = require("../config/firebase");
@@ -426,10 +426,10 @@ router.patch("/:device_uid/apps/:package_name/status", async (req, res) => {
 });
 
 // DELETE /api/devices/:device_uid/policy   (unassign + reverse policy for THIS device only)
-router.delete("/:device_uid/policy", requireAuth, async (req, res) => {
+router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const orgId = req.user.is_super_admin ? req.query.organization_id || req.user.organization_id : req.user.organization_id;
+    const orgId = req.user.organization_id;
 
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, orgId]);
     const device = deviceResult.rows[0];
@@ -539,10 +539,10 @@ router.patch("/:device_uid/assign", requireAuth, requireRole("OrganizationAdmin"
 });
 
 // PATCH /api/devices/:device_uid/unassign   (SRS-007 FR-10)
-router.patch("/:device_uid/unassign", requireAuth, async (req, res) => {
+router.patch("/:device_uid/unassign", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const orgId = req.user.is_super_admin ? req.query.organization_id || req.user.organization_id : req.user.organization_id;
+    const orgId = req.user.organization_id;
 
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, orgId]);
     const device = deviceResult.rows[0];
@@ -560,10 +560,10 @@ router.patch("/:device_uid/unassign", requireAuth, async (req, res) => {
 
 // DELETE /api/devices/:device_uid   (SRS-007 FR-11) — unenroll / remove device
 // BR-05: removed devices lose all policy associations.
-router.delete("/:device_uid", requireAuth, async (req, res) => {
+router.delete("/:device_uid", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const orgId = req.user.is_super_admin ? req.query.organization_id || req.user.organization_id : req.user.organization_id;
+    const orgId = req.user.organization_id;
 
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, orgId]);
     const device = deviceResult.rows[0];
@@ -590,7 +590,7 @@ router.delete("/:device_uid", requireAuth, async (req, res) => {
 // OS-managed monitoring); a rectangular/2-point boundary would need
 // the app to manually poll GPS on its own, which is far less
 // battery-friendly and wasn't worth it for what this adds.
-router.post("/:device_uid/geofence", requireAuth, async (req, res) => {
+router.post("/:device_uid/geofence", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
     const { lat, lng, radius_meters } = req.body;
@@ -628,7 +628,7 @@ router.post("/:device_uid/geofence", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/devices/:device_uid/geofence   (Admin only)
-router.delete("/:device_uid/geofence", requireAuth, async (req, res) => {
+router.delete("/:device_uid/geofence", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, req.user.organization_id]);

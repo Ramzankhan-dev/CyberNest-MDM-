@@ -1,6 +1,7 @@
 const express = require("express");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const { blockSuperAdmin } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -10,12 +11,12 @@ function isValidCode(code) {
 }
 
 // POST /api/departments   (SRS-005)
-router.post("/", requireAuth, async (req, res) => {
+// Super Admin is read-only for Departments — blockSuperAdmin below
+// returns 403 before this handler ever runs for a Super Admin caller.
+router.post("/", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
-    const { name, code, manager_employee_id, description, default_policy_id, status, organization_id } = req.body;
-    // Super Admin can create a department in ANY organization by passing
-    // organization_id; a regular admin is always scoped to their own.
-    const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
+    const { name, code, manager_employee_id, description, default_policy_id, status } = req.body;
+    const orgId = req.user.organization_id;
 
     if (!name || name.trim().length < 3 || name.trim().length > 100) {
       return res.status(400).json({ error: "Department name is required (3-100 characters)" });
@@ -115,16 +116,16 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 // PUT /api/departments/:id   (SRS-005)
-router.put("/:id", requireAuth, async (req, res) => {
+router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description, default_policy_id, status } = req.body;
 
-    // Confirm the department exists, and (for non-super-admins) belongs to their org
+    // Confirm the department exists and belongs to this admin's org
     const existing = await pool.query("SELECT * FROM departments WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Department not found" });
     const dept = existing.rows[0];
-    if (!req.user.is_super_admin && dept.organization_id !== req.user.organization_id) {
+    if (dept.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Department not found" });
     }
 
@@ -152,7 +153,7 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 // PATCH /api/departments/:id/manager   (SRS-005 FR-06)
-router.patch("/:id/manager", requireAuth, async (req, res) => {
+router.patch("/:id/manager", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { manager_employee_id } = req.body;
@@ -160,7 +161,7 @@ router.patch("/:id/manager", requireAuth, async (req, res) => {
     const existing = await pool.query("SELECT * FROM departments WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Department not found" });
     const dept = existing.rows[0];
-    if (!req.user.is_super_admin && dept.organization_id !== req.user.organization_id) {
+    if (dept.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Department not found" });
     }
 
@@ -186,14 +187,14 @@ router.patch("/:id/manager", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/departments/:id   (SRS-005 BR-05)
-router.delete("/:id", requireAuth, async (req, res) => {
+router.delete("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
     const existing = await pool.query("SELECT * FROM departments WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Department not found" });
     const dept = existing.rows[0];
-    if (!req.user.is_super_admin && dept.organization_id !== req.user.organization_id) {
+    if (dept.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Department not found" });
     }
 

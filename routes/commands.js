@@ -3,7 +3,7 @@ const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/roles");
-const { getManagedDepartmentId } = require("../middleware/roles");
+const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -138,7 +138,7 @@ router.post("/:id/ack", async (req, res) => {
 // Only meaningful in the brief window before a command is actually sent
 // to Firebase — our dispatch is synchronous, so this mostly guards
 // against double-submission races rather than a long queue wait.
-router.patch("/:id/cancel", requireAuth, async (req, res) => {
+router.patch("/:id/cancel", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
@@ -159,7 +159,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
 });
 
 // POST /api/commands/:id/retry   (SRS-010 FR-10)
-router.post("/:id/retry", requireAuth, async (req, res) => {
+router.post("/:id/retry", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const original = await pool.query(

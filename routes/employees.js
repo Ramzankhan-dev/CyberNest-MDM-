@@ -3,7 +3,7 @@ const bcrypt = require("bcryptjs");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/roles");
-const { getManagedDepartmentId } = require("../middleware/roles");
+const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
 
@@ -133,7 +133,7 @@ async function getEmployeeOrgId(employeeId) {
 
 // PATCH /api/employees/:id/set-password   (Admin only — employees don't
 // self-register or reset their own password from this project's UI)
-router.patch("/:id/set-password", requireAuth, async (req, res) => {
+router.patch("/:id/set-password", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { password } = req.body;
@@ -143,7 +143,7 @@ router.patch("/:id/set-password", requireAuth, async (req, res) => {
 
     const orgId = await getEmployeeOrgId(id);
     if (!orgId) return res.status(404).json({ error: "Employee not found" });
-    if (!req.user.is_super_admin && orgId !== req.user.organization_id) {
+    if (orgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
     }
 
@@ -314,14 +314,14 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 // PUT /api/employees/:id   (SRS-006 FR-04)
-router.put("/:id", requireAuth, async (req, res) => {
+router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { first_name, last_name, email, phone_number, designation, status } = req.body;
 
     const empOrgId = await getEmployeeOrgId(id);
     if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
-    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+    if (empOrgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
     }
 
@@ -352,14 +352,14 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 // PATCH /api/employees/:id/department   (SRS-006 FR-07 — transfer)
-router.patch("/:id/department", requireAuth, async (req, res) => {
+router.patch("/:id/department", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { department_id } = req.body;
 
     const empOrgId = await getEmployeeOrgId(id);
     if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
-    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+    if (empOrgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
     }
 
