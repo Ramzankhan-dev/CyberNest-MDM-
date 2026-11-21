@@ -3,6 +3,8 @@ const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
 
+const { CRITICAL_ACTIONS } = require("../utils/criticalActions");
+
 const router = express.Router();
 
 // GET /api/dashboard/summary — the 8 KPI cards, scoped by role:
@@ -76,6 +78,10 @@ router.get("/summary", requireAuth, async (req, res) => {
          FROM organizations`
       );
       const employeeCount = await pool.query("SELECT COUNT(*) FROM employees");
+      const criticalWeek = await pool.query(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = ANY($1::text[]) AND created_at > NOW() - INTERVAL '7 days'",
+        [CRITICAL_ACTIONS]
+      );
       const pendingEnrollments = await pool.query("SELECT COUNT(*) FROM devices WHERE status = 'pending'");
       totalOrganizations = parseInt(orgCount.rows[0].total);
       platform = {
@@ -84,6 +90,7 @@ router.get("/summary", requireAuth, async (req, res) => {
         total_employees: parseInt(employeeCount.rows[0].count),
         rooted_devices: parseInt(rootedDevices.rows[0].count),
         pending_devices: parseInt(pendingEnrollments.rows[0].count),
+        critical_events_7d: parseInt(criticalWeek.rows[0].count),
       };
     }
 
