@@ -11,7 +11,11 @@ function isValidCode(code) {
   return /^[A-Z0-9]{3,20}$/.test(code);
 }
 function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return typeof email === "string" &&
+    /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/.test(email.trim());
+}
+function isValidPassword(password) {
+  return typeof password === "string" && /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(password);
 }
 
 // ===================== SUPER ADMIN: manage ALL organizations =====================
@@ -74,7 +78,8 @@ router.get("/", requireAuth, requireSuperAdmin, async (req, res) => {
 // Optionally also creates its first Organization Admin in the same call.
 router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
   try {
-    const { name, code, industry, email, contact_number, country, city, address, status, admin_name, admin_email, admin_password } = req.body;
+    const { name, code, industry, contact_number, country, city, address, status, admin_name, admin_password, admin_confirm_password } = req.body;
+    const email = typeof req.body.email === "string" ? req.body.email.trim() : req.body.email;
 
     if (!name || name.trim().length < 3 || name.trim().length > 100) {
       return res.status(400).json({ error: "Organization name is required" });
@@ -85,6 +90,23 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
     if (!industry) return res.status(400).json({ error: "Industry is required" });
     if (!email || !isValidEmail(email)) return res.status(400).json({ error: "Enter a valid email address" });
     if (!country) return res.status(400).json({ error: "Country is required" });
+
+    // The Organization Admin (if created) signs in with the organization's email.
+    const wantsAdmin = !!(admin_name || admin_password);
+    if (wantsAdmin) {
+      if (!admin_name || !admin_name.trim()) return res.status(400).json({ error: "Admin name is required" });
+      if (!admin_password) return res.status(400).json({ error: "Admin password is required" });
+      if (!isValidPassword(admin_password)) {
+        return res.status(400).json({ error: "Password must be at least 8 characters and contain both letters and numbers" });
+      }
+      if (admin_confirm_password !== undefined && admin_confirm_password !== admin_password) {
+        return res.status(400).json({ error: "Passwords do not match" });
+      }
+      const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+      if (existingUser.rows.length > 0) {
+        return res.status(409).json({ error: "A user with this email already exists" });
+      }
+    }
 
     const dupName = await pool.query("SELECT id FROM organizations WHERE LOWER(name) = LOWER($1)", [name.trim()]);
     if (dupName.rows.length > 0) return res.status(409).json({ error: "Organization name already exists" });
@@ -101,17 +123,14 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
 
     // BR-02: every organization must have at least one Organization Admin —
     // create one now if credentials were supplied for it.
-    if (admin_name && admin_email && admin_password) {
-      const existingAdmin = await pool.query("SELECT id FROM users WHERE email = $1", [admin_email]);
-      if (existingAdmin.rows.length === 0) {
-        const roleResult = await pool.query("SELECT id FROM roles WHERE name = 'OrganizationAdmin'");
-        const hash = await bcrypt.hash(admin_password, 10);
-        await pool.query(
-          `INSERT INTO users (name, email, password_hash, organization_id, role, role_id, status)
-           VALUES ($1, $2, $3, $4, 'super_admin', $5, 'active')`,
-          [admin_name, admin_email, hash, org.id, roleResult.rows[0]?.id || null]
-        );
-      }
+    if (wantsAdmin) {
+      const roleResult = await pool.query("SELECT id FROM roles WHERE name = 'OrganizationAdmin'");
+      const hash = await bcrypt.hash(admin_password, 10);
+      await pool.query(
+        `INSERT INTO users (name, email, password_hash, organization_id, role, role_id, status)
+         VALUES ($1, $2, $3, $4, 'super_admin', $5, 'active')`,
+        [admin_name.trim(), email, hash, org.id, roleResult.rows[0]?.id || null]
+      );
     }
 
     await logAudit({ userId: req.user.id, organizationId: org.id, action: "organization_created", status: "success", req, details: org.name });
@@ -127,7 +146,8 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
 router.put("/:id", requireAuth, requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, industry, email, contact_number, country, city, address } = req.body;
+    const { name, industry, contact_number, country, city, address } = req.body;
+    const email = typeof req.body.email === "string" ? req.body.email.trim() : req.body.email;
 
     if (name) {
       const dupName = await pool.query("SELECT id FROM organizations WHERE LOWER(name) = LOWER($1) AND id != $2", [name.trim(), id]);
