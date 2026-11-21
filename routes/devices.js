@@ -7,6 +7,7 @@ const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles
 
 const logAudit = require("../utils/auditLog");
 const admin = require("../config/firebase");
+const { getDevicePolicies, mergePolicies, buildUnblockDiff, getEffectivePolicyByUid } = require("../utils/policyCommands");
 
 const router = express.Router();
 
@@ -285,20 +286,9 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
 router.get("/:device_uid/current-policy", async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const result = await pool.query(
-      `SELECT p.* FROM device_policies dp
-       JOIN devices d ON dp.device_id = d.id
-       JOIN policies p ON dp.policy_id = p.id
-       WHERE d.device_uid = $1
-       ORDER BY dp.assigned_at DESC LIMIT 1`,
-      [device_uid]
-    );
-
-    if (result.rows.length === 0) {
-      return res.json({ policy: null });
-    }
-
-    res.json({ policy: result.rows[0] });
+    // Merged result of ALL policies assigned to the device (not just the latest).
+    const policy = await getEffectivePolicyByUid(pool, device_uid);
+    res.json({ policy: policy || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -439,31 +429,12 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Selected device does not exist" });
 
-    const latest = await pool.query(
-      `SELECT p.* FROM device_policies dp JOIN policies p ON dp.policy_id = p.id
-       WHERE dp.device_id = $1 ORDER BY dp.assigned_at DESC LIMIT 1`,
-      [device.id]
-    );
-    const policy = latest.rows[0];
+    // Reverse every policy assigned to this device (not just the latest one).
+    const allPolicies = await getDevicePolicies(pool, device.id);
+    const policy = allPolicies[allPolicies.length - 1];
 
     if (policy && device.fcm_token) {
-      const commands = [];
-      if (policy.camera_blocked) commands.push({ type: "unblock_camera" });
-      if (policy.bluetooth_blocked) commands.push({ type: "unblock_bluetooth" });
-      if (policy.wifi_restricted) commands.push({ type: "unblock_wifi" });
-      if (policy.usb_transfer_blocked) commands.push({ type: "unblock_usb" });
-      if (policy.screenshot_blocked) commands.push({ type: "unblock_screenshot" });
-      if (policy.usb_debugging_blocked) commands.push({ type: "unblock_usb_debugging" });
-      if (policy.mobile_hotspot_blocked) commands.push({ type: "unblock_hotspot" });
-      if (policy.airplane_mode_blocked) commands.push({ type: "unblock_airplane_mode" });
-      if (policy.location_services_blocked) commands.push({ type: "unblock_location" });
-      if (policy.factory_reset_blocked) commands.push({ type: "unblock_factory_reset" });
-      if (policy.kiosk_mode) commands.push({ type: "disable_kiosk" });
-      if (policy.blocked_apps) {
-        policy.blocked_apps.split(",").map((p) => p.trim()).filter(Boolean).forEach((pkg) => {
-          commands.push({ type: "unblock_app", extra: { package_name: pkg } });
-        });
-      }
+      const commands = buildUnblockDiff(mergePolicies(allPolicies), null);
 
       for (const cmd of commands) {
         const cmdLog = await pool.query(
@@ -482,7 +453,7 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
     await pool.query("DELETE FROM device_policies WHERE device_id = $1", [device.id]);
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_policy_unassigned", status: "success", req, details: device_uid });
-    res.json({ message: policy ? `Policy "${policy.name}" reversed and unassigned` : "No policy was assigned to this device" });
+    res.json({ message: policy ? `Policy "${allPolicies.map((p) => p.name).join(", ")}" reversed and unassigned` : "No policy was assigned to this device" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

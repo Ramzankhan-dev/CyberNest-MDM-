@@ -2,6 +2,7 @@ const express = require("express");
 const pool = require("../config/db");
 const logAudit = require("../utils/auditLog");
 const computeStatus = require("../utils/computeCompliance");
+const { getEffectivePolicyByUid } = require("../utils/policyCommands");
 
 const router = express.Router();
 
@@ -162,15 +163,9 @@ router.get("/policies/default", async (req, res) => {
   if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
 
   try {
-    const result = await pool.query(
-      `SELECT p.* FROM device_policies dp
-       JOIN devices d ON dp.device_id = d.id
-       JOIN policies p ON dp.policy_id = p.id
-       WHERE d.device_uid = $1
-       ORDER BY dp.assigned_at DESC LIMIT 1`,
-      [device_uid]
-    );
-    res.json({ policy: result.rows[0] || null });
+    // Merged result of ALL policies assigned to the device.
+    const policy = await getEffectivePolicyByUid(pool, device_uid);
+    res.json({ policy: policy || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

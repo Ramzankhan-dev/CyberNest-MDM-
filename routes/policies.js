@@ -5,6 +5,10 @@ const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/roles");
 const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
+const {
+  mergePolicies, getDevicePolicies, pushView,
+  buildCommandsForPolicy, buildUnblockDiff,
+} = require("../utils/policyCommands");
 
 const router = express.Router();
 
@@ -249,11 +253,16 @@ router.delete("/:id/unassign", requireAuth, blockSuperAdmin, async (req, res) =>
       [id]
     );
 
-    const unblockCommands = buildUnblockCommandsForPolicy(policy);
+    // Only undo what no OTHER policy on the same device still needs, then
+    // re-apply whatever the remaining policies require.
     let notified = 0;
     for (const device of assignedDevices.rows) {
       if (device.fcm_token) {
-        for (const cmd of unblockCommands) {
+        const all = await getDevicePolicies(pool, device.id);
+        const remaining = all.filter((p) => String(p.id) !== String(policy.id));
+        const unblockCommands = buildUnblockDiff(mergePolicies(all), mergePolicies(remaining));
+        const reapplyCommands = buildCommandsForPolicy(pushView(mergePolicies(remaining)));
+        for (const cmd of [...unblockCommands, ...reapplyCommands]) {
           await sendCommandToDevice(device, cmd.type, req.user.id, cmd.extra || {});
         }
         notified++;
@@ -320,66 +329,6 @@ async function sendCommandToDevice(device, commandType, issuedBy, extra = {}) {
   await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
 }
 
-function buildCommandsForPolicy(policy) {
-  const commands = [];
-  // camera_blocked, bluetooth_blocked, and kiosk_mode are the three
-  // restrictions the dashboard labels "Working hours (kiosk/camera/
-  // bluetooth auto-toggle)" — when a schedule is set, only the
-  // on-device 30s check (HomeActivity.checkWorkingHoursAndEnforce,
-  // which uses the device's own local time) should ever turn them on
-  // or off. Pushing them immediately here too — regardless of the
-  // schedule — used to cause a visible flicker: kiosk would engage
-  // for a few seconds right on assignment, then the on-device check
-  // would notice it's outside the window and undo it a moment later.
-  const hasSchedule = !!(policy.working_hours_start && policy.working_hours_end);
-
-  if (policy.camera_blocked && !hasSchedule) commands.push({ type: "block_camera" });
-  if (policy.bluetooth_blocked && !hasSchedule) commands.push({ type: "block_bluetooth" });
-  if (policy.wifi_restricted) commands.push({ type: "block_wifi" });
-  if (policy.usb_transfer_blocked) commands.push({ type: "block_usb" });
-  if (policy.screenshot_blocked) commands.push({ type: "block_screenshot" });
-  if (policy.usb_debugging_blocked) commands.push({ type: "block_usb_debugging" });
-  if (policy.mobile_hotspot_blocked) commands.push({ type: "block_hotspot" });
-  if (policy.airplane_mode_blocked) commands.push({ type: "block_airplane_mode" });
-  if (policy.location_services_blocked) commands.push({ type: "block_location" });
-  if (policy.factory_reset_blocked) commands.push({ type: "block_factory_reset" });
-  if (policy.auto_lock_timeout_minutes) commands.push({ type: "set_auto_lock", extra: { minutes: String(policy.auto_lock_timeout_minutes) } });
-  if (policy.password_required && policy.password_min_length) {
-    commands.push({ type: "set_password_policy", extra: { min_length: String(policy.password_min_length), max_failed: String(policy.max_failed_attempts || 5) } });
-  }
-  if (policy.blocked_apps) {
-    policy.blocked_apps.split(",").map((p) => p.trim()).filter(Boolean).forEach((pkg) => {
-      commands.push({ type: "block_app", extra: { package_name: pkg } });
-    });
-  }
-  if (policy.kiosk_mode && !hasSchedule) commands.push({ type: "enable_kiosk", extra: policy.kiosk_package ? { package_name: policy.kiosk_package } : {} });
-  return commands;
-}
-
-// Mirrors buildCommandsForPolicy — sends the opposite (unblock_*) commands
-// so unassigning a policy genuinely reverses it on the device, not just
-// clears the database record.
-function buildUnblockCommandsForPolicy(policy) {
-  const commands = [];
-  if (policy.camera_blocked) commands.push({ type: "unblock_camera" });
-  if (policy.bluetooth_blocked) commands.push({ type: "unblock_bluetooth" });
-  if (policy.wifi_restricted) commands.push({ type: "unblock_wifi" });
-  if (policy.usb_transfer_blocked) commands.push({ type: "unblock_usb" });
-  if (policy.screenshot_blocked) commands.push({ type: "unblock_screenshot" });
-  if (policy.usb_debugging_blocked) commands.push({ type: "unblock_usb_debugging" });
-  if (policy.mobile_hotspot_blocked) commands.push({ type: "unblock_hotspot" });
-  if (policy.airplane_mode_blocked) commands.push({ type: "unblock_airplane_mode" });
-  if (policy.location_services_blocked) commands.push({ type: "unblock_location" });
-  if (policy.factory_reset_blocked) commands.push({ type: "unblock_factory_reset" });
-  if (policy.blocked_apps) {
-    policy.blocked_apps.split(",").map((p) => p.trim()).filter(Boolean).forEach((pkg) => {
-      commands.push({ type: "unblock_app", extra: { package_name: pkg } });
-    });
-  }
-  if (policy.kiosk_mode) commands.push({ type: "disable_kiosk" });
-  return commands;
-}
-
 // POST /api/policies/:id/assign   (SRS-009 FR-04) — assign to one device
 router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
   try {
@@ -410,11 +359,15 @@ router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "Depart
       }
     }
 
-    const commands = buildCommandsForPolicy(policy);
+    // A device can hold several policies at once: build the commands from
+    // ALL of them merged, so this assignment never cancels an earlier one.
+    const existing = (await getDevicePolicies(pool, device.id)).filter((p) => String(p.id) !== String(policy.id));
+    const commands = buildCommandsForPolicy(pushView(mergePolicies([...existing, policy])));
     for (const cmd of commands) {
       await sendCommandToDevice(device, cmd.type, req.user.id, cmd.extra || {});
     }
 
+    await pool.query(`DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2`, [device.id, policy.id]);
     await pool.query(`INSERT INTO device_policies (device_id, policy_id) VALUES ($1, $2)`, [device.id, policy.id]);
     await logAudit({ userId: req.user.id, organizationId: policy.organization_id, action: "policy_assigned", status: "success", req, details: `${policy.name} -> ${device_uid}` });
 
@@ -452,10 +405,12 @@ router.post("/:id/assign-department", requireAuth, requireRole("OrganizationAdmi
 
     let count = 0;
     for (const device of devicesResult.rows) {
-      const commands = buildCommandsForPolicy(policy);
+      const existing = (await getDevicePolicies(pool, device.id)).filter((p) => String(p.id) !== String(policy.id));
+      const commands = buildCommandsForPolicy(pushView(mergePolicies([...existing, policy])));
       for (const cmd of commands) {
         await sendCommandToDevice(device, cmd.type, req.user.id, cmd.extra || {});
       }
+      await pool.query(`DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2`, [device.id, policy.id]);
       await pool.query(`INSERT INTO device_policies (device_id, policy_id) VALUES ($1, $2)`, [device.id, policy.id]);
       count++;
     }
