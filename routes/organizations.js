@@ -53,6 +53,7 @@ router.get("/", requireAuth, requireSuperAdmin, async (req, res) => {
               (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = o.id) AS employee_count,
               (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = o.id AND e.role = 'DepartmentManager') AS manager_count,
               (SELECT COUNT(*) FROM devices dv WHERE dv.organization_id = o.id) AS device_count,
+              (SELECT COUNT(*) FROM policies p WHERE p.organization_id = o.id) AS policy_count,
               (SELECT u.name FROM users u WHERE u.organization_id = o.id AND u.is_super_admin = FALSE ORDER BY u.id LIMIT 1) AS admin_name
        FROM organizations o
        ${whereClause}
