@@ -3,6 +3,8 @@ const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
 
+const { CRITICAL_ACTIONS } = require("../utils/criticalActions");
+
 const router = express.Router();
 
 // GET /api/dashboard/summary — the 8 KPI cards, scoped by role:
@@ -67,9 +69,22 @@ router.get("/summary", requireAuth, async (req, res) => {
     );
 
     let totalOrganizations = 1; // OrgAdmin/DeptManager only ever see their own org
+    let platform = {};
     if (roleName === "SuperAdmin") {
-      const orgCount = await pool.query("SELECT COUNT(*) FROM organizations");
-      totalOrganizations = parseInt(orgCount.rows[0].count);
+      const orgCount = await pool.query(
+        `SELECT COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status = 'active') AS active,
+                COUNT(*) FILTER (WHERE status = 'suspended') AS suspended
+         FROM organizations`
+      );
+      const employeeCount = await pool.query("SELECT COUNT(*) FROM employees");
+      totalOrganizations = parseInt(orgCount.rows[0].total);
+      platform = {
+        active_organizations: parseInt(orgCount.rows[0].active),
+        suspended_organizations: parseInt(orgCount.rows[0].suspended),
+        total_employees: parseInt(employeeCount.rows[0].count),
+        rooted_devices: parseInt(rootedDevices.rows[0].count),
+      };
     }
 
     res.json({
@@ -81,6 +96,7 @@ router.get("/summary", requireAuth, async (req, res) => {
       policy_violations: parseInt(rootedDevices.rows[0].count),
       pending_commands: parseInt(pendingCommands.rows[0].count),
       todays_alerts: parseInt(todaysAlerts.rows[0].count),
+      ...platform,
     });
 
     await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "dashboard_accessed", status: "success", req });
@@ -118,12 +134,19 @@ router.get("/charts", requireAuth, async (req, res) => {
     const online = devices.filter((d) => d.last_seen && (Date.now() - new Date(d.last_seen).getTime()) < 90000).length;
     const offline = devices.length - online;
 
-    // Android version distribution
-    const versionCounts = {};
-    devices.forEach((d) => {
-      const v = d.android_version || "Unknown";
-      versionCounts[v] = (versionCounts[v] || 0) + 1;
-    });
+    // Android version distribution — straight from devices.android_version
+    // (reported by the agent at enrollment). Devices still waiting to enroll
+    // have no version yet, so they are left out instead of showing as "Unknown".
+    const versionResult = await pool.query(
+      `SELECT COALESCE(NULLIF(TRIM(dv.android_version), ''), 'Unknown') AS version, COUNT(DISTINCT dv.id) AS count
+       FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE ${deviceWhere} AND dv.status <> 'pending'
+       GROUP BY 1
+       ORDER BY (CASE WHEN SUBSTRING(MAX(dv.android_version) FROM '^[0-9]+') IS NULL THEN -1
+                      ELSE SUBSTRING(MAX(dv.android_version) FROM '^[0-9]+')::int END) DESC`,
+      deviceParams
+    );
+    const androidVersions = versionResult.rows.map((r) => ({ version: r.version, count: parseInt(r.count) }));
 
     // Device distribution — by department for Org Admin/Department
     // Manager (department is meaningful within one org); by
@@ -134,7 +157,8 @@ router.get("/charts", requireAuth, async (req, res) => {
       const orgDistResult = await pool.query(
         `SELECT org.name, COUNT(dv.id) AS device_count FROM organizations org
          LEFT JOIN devices dv ON dv.organization_id = org.id
-         GROUP BY org.name`
+         GROUP BY org.id, org.name
+         ORDER BY COUNT(dv.id) DESC, org.name`
       );
       deviceDistribution = orgDistResult.rows.map((r) => ({ department: r.name, count: parseInt(r.device_count) }));
     } else if (roleName === "DepartmentManager") {
@@ -168,7 +192,7 @@ router.get("/charts", requireAuth, async (req, res) => {
     res.json({
       device_status: { online, offline },
       device_distribution: deviceDistribution,
-      android_versions: Object.entries(versionCounts).map(([version, count]) => ({ version, count })),
+      android_versions: androidVersions,
       policy_compliance: { compliant, non_compliant: devices.length - compliant },
       device_health: { avg_battery: avgBattery },
     });
@@ -181,6 +205,28 @@ router.get("/charts", requireAuth, async (req, res) => {
 // GET /api/dashboard/activity — latest 20 activities
 router.get("/activity", requireAuth, async (req, res) => {
   try {
+    // Super Admin has no organization of their own — show platform-wide audit
+    // activity instead (mapped onto the same row shape the dashboard table uses).
+    if (req.user.is_super_admin) {
+      const platform = await pool.query(
+        `SELECT al.id, al.action, al.created_at, u.name AS user_name, u.email AS user_email, org.name AS organization
+         FROM audit_logs al
+         LEFT JOIN users u ON al.user_id = u.id
+         LEFT JOIN roles r ON u.role_id = r.id
+         LEFT JOIN organizations org ON al.organization_id = org.id
+         WHERE COALESCE(r.name, u.role) IS DISTINCT FROM 'DepartmentManager'
+           AND al.action <> 'dashboard_accessed'
+         ORDER BY al.created_at DESC LIMIT 20`
+      );
+      return res.json(platform.rows.map((r) => ({
+        id: r.id,
+        command_type: r.action,
+        status: null,
+        issued_at: r.created_at,
+        employee_name: [r.organization, r.user_name || r.user_email].filter(Boolean).join(" — ") || "System",
+        device_uid: null,
+      })));
+    }
     const result = await pool.query(
       `SELECT c.id, c.command_type, c.status, c.issued_at, d.employee_name, d.device_uid
        FROM commands c JOIN devices d ON c.device_id = d.id
@@ -197,6 +243,22 @@ router.get("/activity", requireAuth, async (req, res) => {
 // GET /api/dashboard/alerts — active alerts (same logic as Alerts page)
 router.get("/alerts", requireAuth, async (req, res) => {
   try {
+    // Super Admin: latest critical security events across all organizations.
+    if (req.user.is_super_admin) {
+      const events = await pool.query(
+        `SELECT al.action, al.details, org.name AS organization
+         FROM audit_logs al
+         LEFT JOIN organizations org ON al.organization_id = org.id
+         WHERE al.action = ANY($1::text[])
+         ORDER BY al.created_at DESC LIMIT 10`,
+        [CRITICAL_ACTIONS]
+      );
+      return res.json(events.rows.map((r) => ({
+        type: "critical_event",
+        device: r.organization || "Platform",
+        message: r.details ? `${r.action} — ${r.details}` : r.action,
+      })));
+    }
     const result = await pool.query("SELECT * FROM devices WHERE organization_id = $1", [req.user.organization_id]);
     const devices = result.rows;
     const alerts = [];
