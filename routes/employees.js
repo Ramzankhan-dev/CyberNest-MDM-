@@ -363,37 +363,100 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 // PUT /api/employees/:id   (SRS-006 FR-04)
-router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
+// PUT /api/employees/:id   (Organization Admin) — edit name, phone, designation, email, status and (optionally) password.
+// Keeps everything that mirrors the employee in step: the linked dashboard login (users), and the assigned device's name.
+router.put("/:id", requireAuth, requireRole("OrganizationAdmin"), blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { first_name, last_name, email, phone_number, designation, status } = req.body;
+    const { first_name, last_name, status, password } = req.body;
+    const has = (field) => req.body[field] !== undefined;
 
     const empOrgId = await getEmployeeOrgId(id);
-    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
-    if (empOrgId !== req.user.organization_id) {
+    if (!empOrgId || empOrgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
     }
+    const current = (await pool.query("SELECT * FROM employees WHERE id = $1", [id])).rows[0];
 
-    const name = first_name && last_name ? `${first_name} ${last_name}`.trim() : null;
-
-    if (email) {
-      const dupEmail = await pool.query(
-        `SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id
-         WHERE d.organization_id = $1 AND e.email = $2 AND e.id != $3`,
-        [empOrgId, email, id]
-      );
-      if (dupEmail.rows.length > 0) return res.status(409).json({ error: "Email already exists" });
+    // Validate every field that was sent before changing anything
+    let name = null;
+    if (has("name") || (first_name && last_name)) {
+      name = (has("name") ? String(req.body.name) : `${first_name} ${last_name}`).trim();
+      if (!name) return res.status(400).json({ error: "Name cannot be empty" });
     }
 
-    const result = await pool.query(
-      `UPDATE employees SET name = COALESCE($1, name), email = COALESCE($2, email),
-        phone_number = COALESCE($3, phone_number), designation = COALESCE($4, designation), status = COALESCE($5, status)
-       WHERE id = $6 RETURNING *`,
-      [name, email, phone_number, designation, status, id]
-    );
+    let email = null;
+    if (has("email")) {
+      email = String(req.body.email).trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address" });
+      if (email.toLowerCase() !== String(current.email || "").toLowerCase()) {
+        const dupEmployee = await pool.query(
+          `SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id
+           WHERE d.organization_id = $1 AND LOWER(e.email) = LOWER($2) AND e.id != $3`,
+          [empOrgId, email, id]
+        );
+        if (dupEmployee.rows.length > 0) return res.status(409).json({ error: "Another employee already uses this email" });
+      }
+      // users.email is unique system-wide (dashboard logins), so check it too — except this employee's own linked login
+      const dupUser = await pool.query(
+        "SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id IS DISTINCT FROM $2",
+        [email, current.linked_user_id]
+      );
+      if (dupUser.rows.length > 0) return res.status(409).json({ error: "This email is already used by another account" });
+    }
 
-    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_updated", status: "success", req });
-    res.json({ message: "Employee updated", employee: result.rows[0] });
+    let phone;
+    if (has("phone_number")) {
+      phone = String(req.body.phone_number || "").trim();
+      if (phone && !/^[0-9+()\-\s]{7,20}$/.test(phone)) return res.status(400).json({ error: "Enter a valid phone number" });
+    }
+    if (status !== undefined && !["active", "suspended"].includes(status)) {
+      return res.status(400).json({ error: "status must be 'active' or 'suspended'" });
+    }
+    let passwordHash = null;
+    if (password) {
+      const ruleError = passwordRuleError(password);
+      if (ruleError) return res.status(400).json({ error: ruleError });
+      passwordHash = await bcrypt.hash(password, 10);
+    }
+
+    const client = await pool.connect();
+    let updated;
+    try {
+      await client.query("BEGIN");
+      updated = (await client.query(
+        `UPDATE employees SET
+           name = COALESCE($1, name),
+           email = COALESCE($2, email),
+           phone_number = CASE WHEN $3::boolean THEN $4 ELSE phone_number END,
+           designation = CASE WHEN $5::boolean THEN $6 ELSE designation END,
+           status = COALESCE($7, status),
+           password_hash = COALESCE($8, password_hash)
+         WHERE id = $9 RETURNING *`,
+        [name, email, has("phone_number"), phone || null, has("designation"), has("designation") ? (String(req.body.designation || "").trim() || null) : null, status || null, passwordHash, id]
+      )).rows[0];
+
+      // Linked dashboard login (Department Manager): same name, email and password
+      if (current.linked_user_id) {
+        await client.query(
+          "UPDATE users SET name = COALESCE($1, name), email = COALESCE($2, email), password_hash = COALESCE($3, password_hash) WHERE id = $4",
+          [name, email, passwordHash, current.linked_user_id]
+        );
+      }
+      // Assigned device shows the employee's current name
+      if (name && current.device_id) {
+        await client.query("UPDATE devices SET employee_name = $1 WHERE id = $2", [name, current.device_id]);
+      }
+      await client.query("COMMIT");
+    } catch (txErr) {
+      await client.query("ROLLBACK");
+      if (txErr.code === "23505") return res.status(409).json({ error: "This email is already used by another account" });
+      throw txErr;
+    } finally {
+      client.release();
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_updated", status: "success", req, details: `employee #${id}${passwordHash ? " (password changed)" : ""}` });
+    res.json({ message: "Employee updated", employee: { ...updated, password_hash: undefined } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -604,6 +667,11 @@ router.delete("/:id", requireAuth, requireRole("OrganizationAdmin"), async (req,
     if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
     if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
       return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const holding = await pool.query("SELECT device_id FROM employees WHERE id = $1", [id]);
+    if (holding.rows[0]?.device_id) {
+      return res.status(409).json({ error: "Please unassign the employee's device before deleting this employee." });
     }
 
     // Clear any department that has this employee set as its manager first

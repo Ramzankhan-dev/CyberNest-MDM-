@@ -170,10 +170,14 @@ router.get("/", requireAuth, async (req, res) => {
     params.push(parseInt(limit), offset);
 
     const result = await pool.query(
-      `SELECT dv.*, e.name AS assigned_employee_name, e.id AS assigned_employee_id, d.name AS department_name
+      `SELECT dv.*, e.name AS assigned_employee_name, e.id AS assigned_employee_id,
+              e.email AS assigned_employee_email, e.phone_number AS assigned_employee_phone, e.designation AS assigned_employee_designation,
+              d.name AS department_name, ep.name AS enrollment_profile_name,
+              CASE WHEN dv.enrollment_profile_id IS NOT NULL THEN 'Profile Enrollment' ELSE 'Normal Enrollment' END AS enrollment_type
        FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
        LEFT JOIN departments d ON d.id = COALESCE(dv.department_id, e.department_id)
+       LEFT JOIN enrollment_profiles ep ON ep.id = dv.enrollment_profile_id
        WHERE ${conditions.join(" AND ")}
        ORDER BY ${orderBy}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
