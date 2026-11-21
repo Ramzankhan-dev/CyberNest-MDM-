@@ -6,7 +6,7 @@ const requireRole = require("../middleware/roles");
 const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 const {
-  mergePolicies, getDevicePolicies, pushView,
+  mergePolicies, getDevicePolicies, getAssignedPolicies, isActive, pushView,
   buildCommandsForPolicy, buildUnblockDiff,
 } = require("../utils/policyCommands");
 
@@ -227,11 +227,45 @@ router.patch("/:id/status", requireAuth, blockSuperAdmin, async (req, res) => {
     const { status } = req.body;
     if (!["active", "disabled"].includes(status)) return res.status(400).json({ error: "status must be active or disabled" });
 
-    const result = await pool.query("UPDATE policies SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *", [status, id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
+    const before = await pool.query("SELECT status FROM policies WHERE id = $1", [id]);
+    if (before.rows.length === 0) return res.status(404).json({ error: "Policy not found" });
+    const wasActive = (before.rows[0].status || "active") === "active";
 
-    await logAudit({ userId: req.user.id, organizationId: result.rows[0].organization_id, action: `policy_${status}`, status: "success", req });
-    res.json({ message: `Policy ${status}`, policy: result.rows[0] });
+    const result = await pool.query("UPDATE policies SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *", [status, id]);
+
+    // Disabling removes this policy's effect from every device it is assigned to
+    // (rules another active policy still needs stay); enabling applies it again.
+    // The assignment itself is kept, so Enable restores it without re-assigning.
+    let devicesUpdated = 0;
+    if (wasActive !== (status === "active")) {
+      const assignedDevices = await pool.query(
+        `SELECT DISTINCT dv.* FROM devices dv JOIN device_policies dp ON dp.device_id = dv.id WHERE dp.policy_id = $1`,
+        [id]
+      );
+      for (const device of assignedDevices.rows) {
+        if (!device.fcm_token) continue;
+        try {
+          const assigned = await getAssignedPolicies(pool, device.id); // statuses already updated
+          const beforeSet = assigned.filter((p) => (String(p.id) === String(id) ? wasActive : isActive(p)));
+          const afterSet = assigned.filter((p) => (String(p.id) === String(id) ? status === "active" : isActive(p)));
+          const unblock = buildUnblockDiff(mergePolicies(beforeSet), mergePolicies(afterSet));
+          const reapply = buildCommandsForPolicy(pushView(mergePolicies(afterSet)));
+          for (const cmd of [...unblock, ...reapply]) {
+            await sendCommandToDevice(device, cmd.type, req.user.id, cmd.extra || {});
+          }
+          devicesUpdated++;
+        } catch (e) {
+          console.error(`Policy ${status}: failed to update device ${device.device_uid}:`, e.message);
+        }
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: result.rows[0].organization_id, action: `policy_${status}`, status: "success", req, details: devicesUpdated ? `${devicesUpdated} device(s) updated` : undefined });
+    res.json({
+      message: devicesUpdated ? `Policy ${status} - ${devicesUpdated} device(s) updated` : `Policy ${status}`,
+      policy: result.rows[0],
+      devices_updated: devicesUpdated,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -339,6 +373,7 @@ router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "Depart
     const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
     const policy = policyResult.rows[0];
     if (!policy) return res.status(404).json({ error: "Policy not found" });
+    if (!isActive(policy)) return res.status(400).json({ error: "This policy is disabled. Enable it before assigning." });
 
     const deviceResult = await pool.query(
       `SELECT dv.*, e.department_id AS employee_department_id FROM devices dv
@@ -396,6 +431,7 @@ router.post("/:id/assign-department", requireAuth, requireRole("OrganizationAdmi
     const policyResult = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
     const policy = policyResult.rows[0];
     if (!policy) return res.status(404).json({ error: "Policy not found" });
+    if (!isActive(policy)) return res.status(400).json({ error: "This policy is disabled. Enable it before assigning." });
 
     const devicesResult = await pool.query(
       `SELECT dv.* FROM devices dv JOIN employees e ON e.device_id = dv.id

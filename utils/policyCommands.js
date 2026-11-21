@@ -77,8 +77,10 @@ function mergePolicies(policies) {
   return merged;
 }
 
-// All policies assigned to a device, oldest first, one row per policy.
-async function getDevicePolicies(db, deviceId) {
+const isActive = (p) => (p.status || "active") === "active";
+
+// Every policy assigned to a device (active AND disabled), oldest first, one row per policy.
+async function getAssignedPolicies(db, deviceId) {
   const result = await db.query(
     `SELECT p.*, dp.assigned_at AS assigned_at
      FROM device_policies dp JOIN policies p ON dp.policy_id = p.id
@@ -88,6 +90,12 @@ async function getDevicePolicies(db, deviceId) {
   const seen = new Map();
   for (const row of result.rows) seen.set(String(row.id), row); // a re-assigned policy keeps its newest position
   return [...seen.values()];
+}
+
+// Only the ACTIVE policies assigned to a device. A disabled policy stays assigned
+// (so enabling it again re-applies it) but has no effect while disabled.
+async function getDevicePolicies(db, deviceId) {
+  return (await getAssignedPolicies(db, deviceId)).filter(isActive);
 }
 
 // Same, looked up by device_uid (used by the Android agent, which has no device id).
@@ -190,6 +198,8 @@ function buildUnblockDiff(before, after) {
 module.exports = {
   mergePolicies,
   getDevicePolicies,
+  getAssignedPolicies,
+  isActive,
   getEffectivePolicyByUid,
   pushView,
   buildCommandsForPolicy,
