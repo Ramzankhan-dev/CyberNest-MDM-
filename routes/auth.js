@@ -106,6 +106,11 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     }
 
     // FR-07 (SRS-004): a suspended organization blocks its admins from logging in
+    if (!user.is_super_admin && user.org_status === "inactive") {
+      await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Organization deleted" });
+      return res.status(403).json({ error: "This organization has been deleted. Dashboard access is no longer available." });
+    }
+
     if (!user.is_super_admin && user.org_status === "suspended") {
       await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Organization suspended" });
       return res.status(403).json({ error: "Your organization has been suspended. Contact CyberNest support." });
@@ -194,15 +199,19 @@ router.post("/refresh", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT s.*, u.email, u.organization_id, r.name AS role_name FROM sessions s
+      `SELECT s.*, u.email, u.organization_id, u.is_super_admin, r.name AS role_name, o.status AS org_status FROM sessions s
        JOIN users u ON s.user_id = u.id
        LEFT JOIN roles r ON u.role_id = r.id
+       LEFT JOIN organizations o ON u.organization_id = o.id
        WHERE s.refresh_token = $1 AND s.revoked = FALSE AND s.expires_at > NOW()`,
       [refreshToken]
     );
     const session = result.rows[0];
     if (!session) {
       return res.status(401).json({ error: "Invalid or expired refresh token" });
+    }
+    if (!session.is_super_admin && session.org_status === "inactive") {
+      return res.status(403).json({ error: "This organization has been deleted. Dashboard access is no longer available." });
     }
 
     const token = jwt.sign(

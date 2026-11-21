@@ -51,6 +51,7 @@ router.get("/", requireAuth, requireSuperAdmin, async (req, res) => {
       `SELECT o.*,
               (SELECT COUNT(*) FROM departments d WHERE d.organization_id = o.id) AS department_count,
               (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = o.id) AS employee_count,
+              (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = o.id AND e.role = 'DepartmentManager') AS manager_count,
               (SELECT COUNT(*) FROM devices dv WHERE dv.organization_id = o.id) AS device_count,
               (SELECT u.name FROM users u WHERE u.organization_id = o.id AND u.is_super_admin = FALSE ORDER BY u.id LIMIT 1) AS admin_name
        FROM organizations o
@@ -146,22 +147,22 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
 router.put("/:id", requireAuth, requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    // The organization's email is locked after creation — any `email` sent
+    // in the body is deliberately ignored.
     const { name, industry, contact_number, country, city, address } = req.body;
-    const email = typeof req.body.email === "string" ? req.body.email.trim() : req.body.email;
 
     if (name) {
       const dupName = await pool.query("SELECT id FROM organizations WHERE LOWER(name) = LOWER($1) AND id != $2", [name.trim(), id]);
       if (dupName.rows.length > 0) return res.status(409).json({ error: "Organization name already exists" });
     }
-    if (email && !isValidEmail(email)) return res.status(400).json({ error: "Enter a valid email address" });
 
     const result = await pool.query(
       `UPDATE organizations SET
-        name = COALESCE($1, name), industry = COALESCE($2, industry), email = COALESCE($3, email),
-        contact_number = COALESCE($4, contact_number), country = COALESCE($5, country),
-        city = COALESCE($6, city), address = COALESCE($7, address)
-       WHERE id = $8 RETURNING *`,
-      [name, industry, email, contact_number, country, city, address, id]
+        name = COALESCE($1, name), industry = COALESCE($2, industry),
+        contact_number = COALESCE($3, contact_number), country = COALESCE($4, country),
+        city = COALESCE($5, city), address = COALESCE($6, address)
+       WHERE id = $7 RETURNING *`,
+      [name, industry, contact_number, country, city, address, id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Organization not found" });
 
@@ -194,18 +195,48 @@ router.patch("/:id/status", requireAuth, requireSuperAdmin, async (req, res) => 
 });
 
 // DELETE /api/organizations/:id  (Super Admin only)
-// BR-04: cannot delete an organization that still has enrolled devices.
+// BR-04: an organization can only be deleted when it has no devices,
+// employees or managers.
 router.delete("/:id", requireAuth, requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const deviceCount = await pool.query("SELECT COUNT(*) FROM devices WHERE organization_id = $1", [id]);
-    if (parseInt(deviceCount.rows[0].count) > 0) {
-      return res.status(409).json({ error: "Cannot delete an organization with enrolled devices. Remove its devices first." });
+    const exists = await pool.query("SELECT id FROM organizations WHERE id = $1", [id]);
+    if (exists.rows.length === 0) return res.status(404).json({ error: "Organization not found" });
+
+    const counts = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM devices WHERE organization_id = $1) AS devices,
+         (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id
+           WHERE d.organization_id = $1 AND e.role = 'Employee') AS employees,
+         (SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id
+           WHERE d.organization_id = $1 AND e.role = 'DepartmentManager') AS managers`,
+      [id]
+    );
+    const devices = parseInt(counts.rows[0].devices);
+    const employees = parseInt(counts.rows[0].employees);
+    const managers = parseInt(counts.rows[0].managers);
+    const blockers = [];
+    if (devices > 0) blockers.push(`${devices} device${devices === 1 ? "" : "s"}`);
+    if (employees > 0) blockers.push(`${employees} employee${employees === 1 ? "" : "s"}`);
+    if (managers > 0) blockers.push(`${managers} manager${managers === 1 ? "" : "s"}`);
+    if (blockers.length > 0) {
+      return res.status(409).json({
+        error: `Cannot delete this organization — it still has ${blockers.join(", ")}. Remove or reassign them first.`,
+        linked: { devices, employees, managers },
+      });
     }
 
     // BR-05: soft delete — mark inactive rather than hard-deleting
     const result = await pool.query("UPDATE organizations SET status = 'inactive' WHERE id = $1 RETURNING *", [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Organization not found" });
+
+    // Revoke dashboard access: end every session of this organization's
+    // dashboard users. Login and requireAuth also reject inactive orgs, so
+    // already-issued tokens stop working immediately.
+    await pool.query(
+      `UPDATE sessions SET revoked = TRUE
+       WHERE user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)`,
+      [id]
+    );
 
     await logAudit({ userId: req.user.id, organizationId: id, action: "organization_deleted", status: "success", req });
     res.json({ message: "Organization deleted" });
