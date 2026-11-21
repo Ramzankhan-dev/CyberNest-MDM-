@@ -200,7 +200,7 @@ router.patch("/:id/status", requireAuth, requireSuperAdmin, async (req, res) => 
 router.delete("/:id", requireAuth, requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const exists = await pool.query("SELECT id FROM organizations WHERE id = $1", [id]);
+    const exists = await pool.query("SELECT id, name FROM organizations WHERE id = $1", [id]);
     if (exists.rows.length === 0) return res.status(404).json({ error: "Organization not found" });
 
     const counts = await pool.query(
@@ -226,21 +226,52 @@ router.delete("/:id", requireAuth, requireSuperAdmin, async (req, res) => {
       });
     }
 
-    // BR-05: soft delete — mark inactive rather than hard-deleting
-    const result = await pool.query("UPDATE organizations SET status = 'inactive' WHERE id = $1 RETURNING *", [id]);
+    // Permanent delete. The organization is empty (no devices / employees /
+    // managers), so remove everything that still hangs off it — dashboard
+    // users (and their sessions), departments, policies, settings, etc. —
+    // in one transaction, children first. Deleting the users also removes
+    // dashboard login access for the organization's admins/managers.
+    const orgName = exists.rows[0].name;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM notification_reads WHERE notification_id IN (SELECT id FROM notifications WHERE organization_id = $1)", [id]);
+      await client.query("DELETE FROM notifications WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM app_installs WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM commands WHERE package_id IN (SELECT id FROM app_packages WHERE organization_id = $1)", [id]);
+      await client.query("DELETE FROM app_packages WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM application_assignments WHERE application_id IN (SELECT id FROM applications WHERE organization_id = $1)", [id]);
+      await client.query("DELETE FROM applications WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM geofence_alerts WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM support_requests WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM organization_settings WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM enrollment_profiles WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM departments WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM policy_versions WHERE policy_id IN (SELECT id FROM policies WHERE organization_id = $1)", [id]);
+      await client.query("DELETE FROM device_policies WHERE policy_id IN (SELECT id FROM policies WHERE organization_id = $1)", [id]);
+      await client.query("DELETE FROM policies WHERE organization_id = $1", [id]);
+      await client.query("DELETE FROM audit_logs WHERE organization_id = $1 OR user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)", [id]);
+      await client.query("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)", [id]);
+      await client.query("DELETE FROM api_keys WHERE user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)", [id]);
+      await client.query("DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)", [id]);
+      await client.query("DELETE FROM users WHERE organization_id = $1 AND is_super_admin = FALSE", [id]);
+      await client.query("DELETE FROM organizations WHERE id = $1", [id]);
+      await client.query("COMMIT");
+    } catch (txErr) {
+      await client.query("ROLLBACK");
+      throw txErr;
+    } finally {
+      client.release();
+    }
 
-    // Revoke dashboard access: end every session of this organization's
-    // dashboard users. Login and requireAuth also reject inactive orgs, so
-    // already-issued tokens stop working immediately.
-    await pool.query(
-      `UPDATE sessions SET revoked = TRUE
-       WHERE user_id IN (SELECT id FROM users WHERE organization_id = $1 AND is_super_admin = FALSE)`,
-      [id]
-    );
-
-    await logAudit({ userId: req.user.id, organizationId: id, action: "organization_deleted", status: "success", req });
-    res.json({ message: "Organization deleted" });
+    // The organization row is gone, so this entry is not linked to it.
+    await logAudit({ userId: req.user.id, action: "organization_deleted", status: "success", req, details: `Deleted organization "${orgName}"` });
+    res.json({ message: "Organization deleted permanently" });
   } catch (err) {
+    if (err.code === "23503") {
+      console.error(err);
+      return res.status(409).json({ error: "Cannot delete this organization — other records still reference it. Remove them first." });
+    }
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }

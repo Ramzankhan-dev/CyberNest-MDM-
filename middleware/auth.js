@@ -23,7 +23,8 @@ async function requireAuth(req, res, next) {
   if (!decoded.is_super_admin && decoded.organization_id) {
     try {
       const org = await pool.query("SELECT status FROM organizations WHERE id = $1", [decoded.organization_id]);
-      if (org.rows[0] && org.rows[0].status === "inactive") {
+      // No row = organization was permanently deleted.
+      if (!org.rows[0] || org.rows[0].status === "inactive") {
         return res.status(403).json({ error: "This organization has been deleted. Dashboard access is no longer available." });
       }
     } catch (err) {
