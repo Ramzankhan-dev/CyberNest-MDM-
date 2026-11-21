@@ -6,6 +6,7 @@ const rateLimit = require("express-rate-limit");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
+const { assignDeviceToLoggedInEmployee, AssignmentError } = require("../utils/deviceAssignment");
 const { sendOtpEmail } = require("../config/mailer");
 
 const router = express.Router();
@@ -474,6 +475,22 @@ router.post("/employee-login", loginRateLimiter, async (req, res) => {
     if (!validPassword) {
       await logAudit({ organizationId: employee.organization_id, action: "employee_login_failed", status: "failure", req, details: "Wrong password" });
       return res.status(401).json({ error: "Invalid Employee ID or Password" });
+    }
+
+    // The device the employee logged in on becomes their device (and joins their department if it had none).
+    if (req.body.device_uid) {
+      try {
+        const linked = await assignDeviceToLoggedInEmployee(pool, employee, req.body.device_uid);
+        if (linked) {
+          await logAudit({ organizationId: employee.organization_id, action: "device_assigned", status: "success", req, details: `${req.body.device_uid} -> employee ${employee.employee_code} (employee login)` });
+        }
+      } catch (assignErr) {
+        if (assignErr instanceof AssignmentError) {
+          await logAudit({ organizationId: employee.organization_id, action: "employee_login_failed", status: "failure", req, details: `${employee.employee_code}: ${assignErr.message}` });
+          return res.status(assignErr.status).json({ error: assignErr.message });
+        }
+        throw assignErr;
+      }
     }
 
     const token = jwt.sign(

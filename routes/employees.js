@@ -6,10 +6,25 @@ const requireRole = require("../middleware/roles");
 const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
+const { passwordRuleError } = require("../utils/passwordRules");
 
 const router = express.Router();
 
 const ALLOWED_ROLES = ["OrganizationAdmin", "DepartmentManager", "Employee"];
+
+// Errors meant for the user (shown as-is). Anything else is logged and returned as a generic server error,
+// so raw database messages never reach the dashboard.
+class UserFacingError extends Error {
+  constructor(message, status = 400) { super(message); this.status = status; }
+}
+const EMAIL_IN_USE_MESSAGE = "This email is already used by another dashboard account. Use a different email for this employee.";
+
+// Maps an error from the manager-account helper to { status, message }, or null if it is not a user-facing error.
+function managerErrorResponse(err) {
+  if (err instanceof UserFacingError) return { status: err.status, message: err.message };
+  if (err && err.code === "23505") return { status: 409, message: EMAIL_IN_USE_MESSAGE }; // unique violation (e.g. users_email_key)
+  return null;
+}
 
 // Creates (or re-suspends-then-reuses, if one already exists from a
 // prior promotion) the dashboard-login "users" account for an
@@ -26,26 +41,55 @@ async function createOrAttachManagerAccount(pool, { employeeId, departmentId, fu
   const alreadyLinkedUserId = employeeRow.rows[0]?.linked_user_id;
 
   if (currentManagerId && currentManagerId !== alreadyLinkedUserId) {
-    throw new Error("This department already has a Department Manager — remove them first");
+    throw new UserFacingError("This department already has a Department Manager — remove them first", 409);
   }
 
   const roleResult = await pool.query("SELECT id FROM roles WHERE name = 'DepartmentManager'");
   const roleId = roleResult.rows[0]?.id;
-  if (!roleId) throw new Error("DepartmentManager role is not configured");
+  if (!roleId) throw new UserFacingError("DepartmentManager role is not configured", 500);
+
+  const ruleError = password ? passwordRuleError(password) : null;
+  if (ruleError) throw new UserFacingError(ruleError);
+  const passwordHash = password ? await bcrypt.hash(password, 10) : null;
 
   let userId = alreadyLinkedUserId;
   if (userId) {
-    // Re-activating a previously-demoted manager account.
-    await pool.query("UPDATE users SET status = 'active', name = $1, role_id = $2 WHERE id = $3", [fullName, roleId, userId]);
-  } else {
-    if (!password || password.length < 8) throw new Error("A password (min 8 characters) is required to create a Department Manager account");
-    const passwordHash = await bcrypt.hash(password, 10);
-    const insertResult = await pool.query(
-      `INSERT INTO users (name, email, password_hash, organization_id, role, role_id, status)
-       VALUES ($1, $2, $3, $4, 'department_manager', $5, 'active') RETURNING id`,
-      [fullName, email, passwordHash, organizationId, roleId]
+    // Re-activating the manager account already linked to this employee (new password only if one was given).
+    await pool.query(
+      "UPDATE users SET status = 'active', name = $1, role = 'department_manager', role_id = $2, password_hash = COALESCE($3, password_hash) WHERE id = $4",
+      [fullName, roleId, passwordHash, userId]
     );
-    userId = insertResult.rows[0].id;
+  } else {
+    // users.email is unique across the whole system, so look for an existing account with this email first.
+    const existingUser = await pool.query(
+      `SELECT u.id, u.organization_id, COALESCE(r.name, u.role) AS role_name,
+              (SELECT e.id FROM employees e WHERE e.linked_user_id = u.id LIMIT 1) AS linked_employee_id
+       FROM users u LEFT JOIN roles r ON u.role_id = r.id
+       WHERE LOWER(u.email) = LOWER($1)
+       ORDER BY (u.email = $1) DESC LIMIT 1`,
+      [email]
+    );
+    const found = existingUser.rows[0];
+    if (found) {
+      const sameOrg = Number(found.organization_id) === Number(organizationId);
+      const isManagerAccount = ["DepartmentManager", "department_manager"].includes(found.role_name);
+      const linkedToOther = found.linked_employee_id && String(found.linked_employee_id) !== String(employeeId);
+      // Only a leftover manager account of this same organization (e.g. from a deleted/demoted employee) may be reused.
+      if (!sameOrg || !isManagerAccount || linkedToOther) throw new UserFacingError(EMAIL_IN_USE_MESSAGE, 409);
+      await pool.query(
+        "UPDATE users SET status = 'active', name = $1, role = 'department_manager', role_id = $2, organization_id = $3, password_hash = COALESCE($4, password_hash) WHERE id = $5",
+        [fullName, roleId, organizationId, passwordHash, found.id]
+      );
+      userId = found.id;
+    } else {
+      if (!password) throw new UserFacingError("A password (min 8 characters, letters and numbers) is required to create a Department Manager account");
+      const insertResult = await pool.query(
+        `INSERT INTO users (name, email, password_hash, organization_id, role, role_id, status)
+         VALUES ($1, $2, $3, $4, 'department_manager', $5, 'active') RETURNING id`,
+        [fullName, email, passwordHash, organizationId, roleId]
+      );
+      userId = insertResult.rows[0].id;
+    }
   }
 
   await pool.query("UPDATE departments SET manager_id = $1 WHERE id = $2", [userId, departmentId]);
@@ -137,9 +181,8 @@ router.patch("/:id/set-password", requireAuth, blockSuperAdmin, async (req, res)
   try {
     const { id } = req.params;
     const { password } = req.body;
-    if (!password || password.length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters" });
-    }
+    const ruleError = passwordRuleError(password);
+    if (ruleError) return res.status(400).json({ error: ruleError });
 
     const orgId = await getEmployeeOrgId(id);
     if (!orgId) return res.status(404).json({ error: "Employee not found" });
@@ -147,8 +190,12 @@ router.patch("/:id/set-password", requireAuth, blockSuperAdmin, async (req, res)
       return res.status(404).json({ error: "Employee not found" });
     }
 
+    // A Department Manager also has a dashboard login (users table) — keep both passwords in sync.
+    const empRow = await pool.query("SELECT role, linked_user_id FROM employees WHERE id = $1", [id]);
+    const linkedUserId = empRow.rows[0]?.role === "DepartmentManager" ? empRow.rows[0].linked_user_id : null;
     const passwordHash = await bcrypt.hash(password, 10);
     await pool.query("UPDATE employees SET password_hash = $1 WHERE id = $2", [passwordHash, id]);
+    if (linkedUserId) await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, linkedUserId]);
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "employee_password_set", status: "success", req, details: `employee #${id}` });
     res.json({ message: "Password set successfully" });
@@ -227,7 +274,9 @@ router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res)
         // rather than leaving an Employee record with a DepartmentManager
         // label but no working dashboard account behind it.
         await pool.query("DELETE FROM employees WHERE id = $1", [result.rows[0].id]);
-        return res.status(400).json({ error: managerErr.message });
+        const friendly = managerErrorResponse(managerErr);
+        if (!friendly) throw managerErr;
+        return res.status(friendly.status).json({ error: friendly.message });
       }
     }
 
@@ -409,7 +458,9 @@ router.patch("/:id/role", requireAuth, requireRole("OrganizationAdmin"), async (
           organizationId: empOrgId,
         });
       } catch (managerErr) {
-        return res.status(400).json({ error: managerErr.message });
+        const friendly = managerErrorResponse(managerErr);
+        if (!friendly) throw managerErr;
+        return res.status(friendly.status).json({ error: friendly.message });
       }
     }
 
@@ -469,10 +520,43 @@ router.patch("/:id/assign-device", requireAuth, requireRole("OrganizationAdmin",
     }
 
     const result = await pool.query("UPDATE employees SET device_id = $1 WHERE id = $2 RETURNING *", [device.id, id]);
-    await pool.query("UPDATE devices SET department_id = $1 WHERE id = $2", [employee.department_id, device.id]);
+    await pool.query("UPDATE devices SET department_id = $1, employee_name = $2 WHERE id = $3", [employee.department_id, employee.name, device.id]);
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_device_assigned", status: "success", req });
     res.json({ message: "Device assigned", employee: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /api/employees/:id/unassign-device — frees the employee's current device so it can be given to someone else
+// (the device keeps its department, so it shows up as a "department unassigned device").
+router.patch("/:id/unassign-device", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const empOrgId = await getEmployeeOrgId(id);
+    if (!empOrgId) return res.status(404).json({ error: "Employee not found" });
+    if (!req.user.is_super_admin && empOrgId !== req.user.organization_id) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const empResult = await pool.query("SELECT * FROM employees WHERE id = $1", [id]);
+    const employee = empResult.rows[0];
+
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      if (!managedDeptId || employee.department_id !== managedDeptId) {
+        return res.status(403).json({ error: "You can only manage devices of employees in your own department" });
+      }
+    }
+    if (!employee.device_id) return res.status(409).json({ error: "This employee has no device assigned" });
+
+    await pool.query("UPDATE devices SET employee_name = NULL WHERE id = $1", [employee.device_id]);
+    await pool.query("UPDATE employees SET device_id = NULL WHERE id = $1", [id]);
+
+    await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_device_unassigned", status: "success", req, details: `employee #${id}` });
+    res.json({ message: "Device unassigned" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

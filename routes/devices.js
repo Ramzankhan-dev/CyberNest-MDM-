@@ -528,7 +528,7 @@ router.patch("/:device_uid/assign", requireAuth, requireRole("OrganizationAdmin"
     // now assigned to — the authoritative field going forward for
     // department-scoping, rather than only resolving it indirectly
     // through the employee link every time.
-    await pool.query("UPDATE devices SET department_id = $1 WHERE id = $2", [employee.department_id, device.id]);
+    await pool.query("UPDATE devices SET department_id = $1, employee_name = $2 WHERE id = $3", [employee.department_id, employee.name, device.id]);
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_assigned", status: "success", req, details: `${device.device_uid} -> employee ${employee_id}` });
 
     res.json({ message: "Device assigned" });
@@ -549,6 +549,7 @@ router.patch("/:device_uid/unassign", requireAuth, blockSuperAdmin, async (req, 
     if (!device) return res.status(404).json({ error: "Selected device does not exist" });
 
     await pool.query("UPDATE employees SET device_id = NULL WHERE device_id = $1", [device.id]);
+    await pool.query("UPDATE devices SET employee_name = NULL WHERE id = $1", [device.id]);
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_unassigned", status: "success", req, details: device.device_uid });
 
     res.json({ message: "Device unassigned" });
