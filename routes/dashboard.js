@@ -3,8 +3,6 @@ const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
 
-const { CRITICAL_ACTIONS } = require("../utils/criticalActions");
-
 const router = express.Router();
 
 // GET /api/dashboard/summary — the 8 KPI cards, scoped by role:
@@ -78,12 +76,14 @@ router.get("/summary", requireAuth, async (req, res) => {
          FROM organizations`
       );
       const employeeCount = await pool.query("SELECT COUNT(*) FROM employees");
+      const pendingEnrollments = await pool.query("SELECT COUNT(*) FROM devices WHERE status = 'pending'");
       totalOrganizations = parseInt(orgCount.rows[0].total);
       platform = {
         active_organizations: parseInt(orgCount.rows[0].active),
         suspended_organizations: parseInt(orgCount.rows[0].suspended),
         total_employees: parseInt(employeeCount.rows[0].count),
         rooted_devices: parseInt(rootedDevices.rows[0].count),
+        pending_devices: parseInt(pendingEnrollments.rows[0].count),
       };
     }
 
@@ -243,15 +243,17 @@ router.get("/activity", requireAuth, async (req, res) => {
 // GET /api/dashboard/alerts — active alerts (same logic as Alerts page)
 router.get("/alerts", requireAuth, async (req, res) => {
   try {
-    // Super Admin: latest critical security events across all organizations.
+    // Super Admin: platform-level critical events only — organization suspended/deleted,
+    // and failed logins with no organization (unknown accounts and the Super Admin account).
+    // Org-level events (wipe/lock, device removed, ...) stay in the Critical Security Events tab.
     if (req.user.is_super_admin) {
       const events = await pool.query(
         `SELECT al.action, al.details, org.name AS organization
          FROM audit_logs al
          LEFT JOIN organizations org ON al.organization_id = org.id
-         WHERE al.action = ANY($1::text[])
-         ORDER BY al.created_at DESC LIMIT 10`,
-        [CRITICAL_ACTIONS]
+         WHERE al.action IN ('organization_suspended', 'organization_deleted')
+            OR (al.action = 'login_failed' AND al.organization_id IS NULL)
+         ORDER BY al.created_at DESC LIMIT 10`
       );
       return res.json(events.rows.map((r) => ({
         type: "critical_event",
