@@ -1,6 +1,7 @@
 const express = require("express");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
+const { CRITICAL_ACTIONS } = require("../utils/criticalActions");
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ const MODULES = ["Authentication", "Device", "Policy", "Command", "Application",
 // GET /api/audit-logs   (SRS-016) — search, filter, pagination
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const { search, module: moduleFilter, status, date_from, date_to, page = 1, limit = 50, organization_id } = req.query;
+    const { search, module: moduleFilter, status, date_from, date_to, page = 1, limit = 50, organization_id, critical } = req.query;
     const orgId = req.user.is_super_admin ? organization_id : req.user.organization_id;
     if (!orgId) return res.status(400).json({ error: "organization_id is required" });
 
@@ -43,6 +44,11 @@ router.get("/", requireAuth, async (req, res) => {
     if (status) {
       params.push(status);
       conditions.push(`al.status = $${params.length}`);
+    }
+    // ?critical=true — only critical security events (see utils/criticalActions.js)
+    if (critical === "true") {
+      params.push(CRITICAL_ACTIONS);
+      conditions.push(`al.action = ANY($${params.length}::text[])`);
     }
     if (date_from) {
       params.push(date_from);
@@ -129,7 +135,7 @@ router.get("/stats", requireAuth, async (req, res) => {
       if (r.action.startsWith("policy_")) policyChanges++;
       if (r.action.startsWith("command_")) commands++;
       if (r.status === "failure") failed++;
-      if (["device_removed", "policy_deleted", "organization_suspended", "login_failed"].includes(r.action)) critical++;
+      if (CRITICAL_ACTIONS.includes(r.action)) critical++;
     });
 
     res.json({
