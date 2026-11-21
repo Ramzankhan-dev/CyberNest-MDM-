@@ -138,6 +138,8 @@ function buildCommandsForPolicy(policy) {
   if (policy.airplane_mode_blocked) commands.push({ type: "block_airplane_mode" });
   if (policy.location_services_blocked) commands.push({ type: "block_location" });
   if (policy.factory_reset_blocked) commands.push({ type: "block_factory_reset" });
+  if (policy.prevent_unknown_sources) commands.push({ type: "block_unknown_sources" });
+  if (policy.prevent_play_store) commands.push({ type: "block_play_store" });
   if (policy.auto_lock_timeout_minutes) commands.push({ type: "set_auto_lock", extra: { minutes: String(policy.auto_lock_timeout_minutes) } });
   if (policy.password_required && policy.password_min_length) {
     commands.push({ type: "set_password_policy", extra: { min_length: String(policy.password_min_length), max_failed: String(policy.max_failed_attempts || 5) } });
@@ -165,6 +167,8 @@ function buildUnblockCommandsForPolicy(policy) {
   if (policy.airplane_mode_blocked) commands.push({ type: "unblock_airplane_mode" });
   if (policy.location_services_blocked) commands.push({ type: "unblock_location" });
   if (policy.factory_reset_blocked) commands.push({ type: "unblock_factory_reset" });
+  if (policy.prevent_unknown_sources) commands.push({ type: "unblock_unknown_sources" });
+  if (policy.prevent_play_store) commands.push({ type: "unblock_play_store" });
   splitApps(policy.blocked_apps).forEach((pkg) => {
     commands.push({ type: "unblock_app", extra: { package_name: pkg } });
   });
