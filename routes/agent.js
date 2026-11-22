@@ -494,7 +494,7 @@ router.post("/unenroll-request", async (req, res) => {
   if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
 
   try {
-    const deviceResult = await pool.query("SELECT organization_id, model FROM devices WHERE device_uid = $1", [device_uid]);
+    const deviceResult = await pool.query("SELECT id, organization_id, model FROM devices WHERE device_uid = $1", [device_uid]);
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Device not found" });
 
@@ -503,6 +503,7 @@ router.post("/unenroll-request", async (req, res) => {
       action: "device_unenroll_requested",
       status: "success",
       req,
+      deviceId: device.id,
       details: `${device.model || device_uid}${reason ? " — " + reason : ""}`,
     });
 
@@ -581,6 +582,7 @@ router.post("/support/tickets", async (req, res) => {
       action: "support_ticket_created",
       status: "success",
       req,
+      deviceId: device.id,
       details: `${ticketNumber} (${device.model || device_uid}): ${description.trim().slice(0, 100)}`,
     });
 

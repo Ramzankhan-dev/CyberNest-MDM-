@@ -2,10 +2,24 @@ const pool = require("../config/db");
 
 // Reusable across every module — every SRS document asks for audit
 // logging, so this one helper is called from many route files.
-async function logAudit({ userId = null, organizationId = null, action, status, req, details = null }) {
+// deviceId (optional) ties an event to a device, so a Department Manager
+// only sees events of devices in their own department.
+async function logAudit({ userId = null, organizationId = null, action, status, req, details = null, deviceId = null }) {
+  const ip = req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || null;
+  const browser = req?.headers?.["user-agent"] || null;
   try {
-    const ip = req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || null;
-    const browser = req?.headers?.["user-agent"] || null;
+    if (deviceId != null) {
+      try {
+        await pool.query(
+          `INSERT INTO audit_logs (user_id, organization_id, action, status, ip_address, browser_info, details, device_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [userId, organizationId, action, status, ip, browser, details, deviceId]
+        );
+        return;
+      } catch (err) {
+        // audit_logs.device_id column not added yet — fall through and log without it
+      }
+    }
     await pool.query(
       `INSERT INTO audit_logs (user_id, organization_id, action, status, ip_address, browser_info, details)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,

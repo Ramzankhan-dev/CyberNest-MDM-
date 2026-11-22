@@ -39,6 +39,18 @@ async function scopeTargetToOwnDepartment(req, target) {
   return null;
 }
 
+// A Department Manager only sees notifications they sent themselves, plus ones the admin sent
+// to their department or to devices of their department — never org-wide ones or other departments'.
+// Returns an SQL condition (or "" for other roles) and pushes its params.
+async function managerVisibility(req, params, alias = "n") {
+  if (req.user.role !== "DepartmentManager") return "";
+  const deptId = (await getManagedDepartmentId(pool, req.user.id)) || 0;
+  params.push(req.user.id, deptId);
+  const u = params.length - 1, d = params.length;
+  return `(${alias}.sent_by = $${u} OR ${alias}.target_department_id = $${d} OR ${alias}.target_device_uid IN (
+    SELECT dv.device_uid FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id WHERE COALESCE(dv.department_id, e.department_id) = $${d}))`;
+}
+
 // Resolves the device list for a given target, shared by send/resend/scheduler
 async function resolveTargetDevices(organizationId, targetDeviceUid, targetDepartmentId) {
   if (targetDeviceUid) {
@@ -208,12 +220,15 @@ router.post("/:id/resend", requireAuth, async (req, res) => {
 // GET /api/notifications/stats   (SRS-014) — the 6 dashboard cards
 router.get("/stats", requireAuth, async (req, res) => {
   try {
-    const orgId = req.user.organization_id;
-    const total = await pool.query("SELECT COUNT(*) FROM notifications WHERE organization_id = $1", [orgId]);
-    const sentToday = await pool.query("SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND sent_at::date = CURRENT_DATE", [orgId]);
-    const scheduled = await pool.query("SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND status = 'scheduled'", [orgId]);
-    const delivered = await pool.query("SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND status = 'delivered'", [orgId]);
-    const failed = await pool.query("SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND status = 'failed'", [orgId]);
+    const params = [req.user.organization_id];
+    const vis = await managerVisibility(req, params);
+    const where = `n.organization_id = $1${vis ? " AND " + vis : ""}`;
+    const count = async (extra = "") => parseInt((await pool.query(`SELECT COUNT(*) FROM notifications n WHERE ${where}${extra}`, params)).rows[0].count);
+    const total = { rows: [{ count: await count() }] };
+    const sentToday = { rows: [{ count: await count(" AND n.sent_at::date = CURRENT_DATE") }] };
+    const scheduled = { rows: [{ count: await count(" AND n.status = 'scheduled'") }] };
+    const delivered = { rows: [{ count: await count(" AND n.status = 'delivered'") }] };
+    const failed = { rows: [{ count: await count(" AND n.status = 'failed'") }] };
 
     res.json({
       total_notifications: parseInt(total.rows[0].count),
@@ -235,6 +250,8 @@ router.get("/", requireAuth, async (req, res) => {
     const { search, notification_type, priority, status, page = 1, limit = 30 } = req.query;
     const conditions = ["n.organization_id = $1"];
     const params = [req.user.organization_id];
+    const vis = await managerVisibility(req, params);
+    if (vis) conditions.push(vis);
 
     if (search) {
       params.push(`%${search}%`);
@@ -276,20 +293,41 @@ router.get("/", requireAuth, async (req, res) => {
 
 // GET /api/notifications/requests — requests coming FROM devices (unenroll request,
 // support ticket). They are also kept in the audit log; this feed shows them in the
-// Notification center and drives the dashboard pop-up. Organization Admin only.
+// Notification center and drives the dashboard pop-up. Organization Admin: all;
+// Department Manager: only their own department's devices.
 const DEVICE_REQUEST_LABELS = {
   device_unenroll_requested: "Unenroll request",
   support_ticket_created: "Support ticket",
 };
 router.get("/requests", requireAuth, async (req, res) => {
   try {
-    if (req.user.is_super_admin || req.user.role !== "OrganizationAdmin") return res.json({ requests: [] });
-    const result = await pool.query(
-      `SELECT id, action, details, created_at FROM audit_logs
-        WHERE organization_id = $1 AND action = ANY($2::text[])
-        ORDER BY id DESC LIMIT 50`,
-      [req.user.organization_id, Object.keys(DEVICE_REQUEST_LABELS)]
-    );
+    const actions = Object.keys(DEVICE_REQUEST_LABELS);
+    let result;
+    if (req.user.is_super_admin) {
+      return res.json({ requests: [] });
+    } else if (req.user.role === "OrganizationAdmin") {
+      result = await pool.query(
+        `SELECT id, action, details, created_at FROM audit_logs
+          WHERE organization_id = $1 AND action = ANY($2::text[])
+          ORDER BY id DESC LIMIT 50`,
+        [req.user.organization_id, actions]
+      );
+    } else if (req.user.role === "DepartmentManager") {
+      // Only requests from devices of the manager's own department (not the manager's own device).
+      const deptId = (await getManagedDepartmentId(pool, req.user.id)) || 0;
+      result = await pool.query(
+        `SELECT al.id, al.action, al.details, al.created_at FROM audit_logs al
+           JOIN devices dv ON dv.id = al.device_id
+           LEFT JOIN employees e ON e.device_id = dv.id
+          WHERE al.organization_id = $1 AND al.action = ANY($2::text[])
+            AND COALESCE(dv.department_id, e.department_id) = $3
+            AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')
+          ORDER BY al.id DESC LIMIT 50`,
+        [req.user.organization_id, actions, deptId]
+      );
+    } else {
+      return res.json({ requests: [] });
+    }
     res.json({ requests: result.rows.map((r) => ({ ...r, type: DEVICE_REQUEST_LABELS[r.action] })) });
   } catch (err) {
     console.error(err);
