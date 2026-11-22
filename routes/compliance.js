@@ -63,7 +63,10 @@ router.get("/", requireAuth, async (req, res) => {
         );
         latestFailed = failCheck.rows.length > 0;
       }
-      const complianceStatus = computeStatus(device, latestFailed);
+      // The shared helper says "Unknown" when no active policy is assigned; on this page
+      // that is shown as "No Policy" (same wording as the summary card).
+      const computed = computeStatus(device, latestFailed);
+      const complianceStatus = computed === "Unknown" ? "No Policy" : computed;
       if (status && complianceStatus.toLowerCase().replace(" ", "-") !== status) continue;
       if (department_id && String(device.department_id) !== String(department_id)) continue;
       if (search) {
