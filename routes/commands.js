@@ -106,10 +106,13 @@ router.post("/:id/ack", async (req, res) => {
     const { status, error_message } = req.body || {};
     const finalStatus = status === "failed" ? "failed" : "executed";
     const result = await pool.query(
-      "UPDATE commands SET status = $1, executed_at = NOW(), error_message = $2 WHERE id = $3 RETURNING *",
+      "UPDATE commands SET status = $1, executed_at = NOW(), error_message = $2 WHERE id = $3 AND status <> 'cancelled' RETURNING *",
       [finalStatus, finalStatus === "failed" ? (error_message || null) : null, id]
     );
     if (result.rows.length === 0) {
+      // A cancelled command stays cancelled even if the device acks it late.
+      const exists = await pool.query("SELECT status FROM commands WHERE id = $1", [id]);
+      if (exists.rows[0]?.status === "cancelled") return res.json({ message: "Command was cancelled" });
       return res.status(404).json({ error: "Command not found" });
     }
     const command = result.rows[0];
@@ -135,9 +138,8 @@ router.post("/:id/ack", async (req, res) => {
 });
 
 // PATCH /api/commands/:id/cancel   (SRS-010 FR-09)
-// Only meaningful in the brief window before a command is actually sent
-// to Firebase — our dispatch is synchronous, so this mostly guards
-// against double-submission races rather than a long queue wait.
+// Only a still-pending command can be cancelled. Once it has been
+// delivered to the device ("sent") it can no longer be cancelled.
 router.patch("/:id/cancel", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -148,7 +150,7 @@ router.patch("/:id/cancel", requireAuth, blockSuperAdmin, async (req, res) => {
       [id, req.user.organization_id]
     );
     if (result.rows.length === 0) {
-      return res.status(409).json({ error: "Command has already been delivered and can no longer be cancelled" });
+      return res.status(409).json({ error: "Command has already been executed or cancelled and can no longer be cancelled" });
     }
     await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "command_cancelled", status: "success", req });
     res.json({ message: "Command cancelled", command: result.rows[0] });
@@ -184,6 +186,36 @@ router.post("/:id/retry", requireAuth, blockSuperAdmin, async (req, res) => {
   }
 });
 
+// POST /api/commands/:id/resend   — send a completed command to the device again
+const PACKAGE_COMMANDS = ["block_app", "unblock_app", "install_app", "uninstall_app"];
+router.post("/:id/resend", requireAuth, blockSuperAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const original = await pool.query(
+      `SELECT c.*, d.device_uid, d.fcm_token, d.organization_id AS device_org_id FROM commands c
+       JOIN devices d ON c.device_id = d.id
+       WHERE c.id = $1 AND d.organization_id = $2`,
+      [id, req.user.organization_id]
+    );
+    const cmd = original.rows[0];
+    if (!cmd) return res.status(404).json({ error: "Command not found" });
+    if (cmd.status !== "executed") return res.status(409).json({ error: "Only completed commands can be resent" });
+    if (PACKAGE_COMMANDS.includes(cmd.command_type)) {
+      return res.status(400).json({ error: "App commands can't be resent from here — send them again from the Applications page" });
+    }
+    if (!cmd.fcm_token) return res.status(400).json({ error: "This device has no FCM token yet" });
+
+    const device = { id: cmd.device_id, device_uid: cmd.device_uid, fcm_token: cmd.fcm_token, organization_id: cmd.device_org_id };
+    const newCommand = await dispatchCommand(device, cmd.command_type, req.user.id, null, req);
+    await pool.query("UPDATE commands SET retry_of = $1 WHERE id = $2", [cmd.id, newCommand.id]);
+
+    res.json({ message: "Command resent", command: newCommand });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
+
 // GET /api/commands   (SRS-010) — unified command history, with tabs/filters
 // ?tab=pending|completed|failed  ?device_uid=  ?department_id=  ?command_type=  ?search=  ?date_from= ?date_to=
 router.get("/", requireAuth, async (req, res) => {
@@ -194,7 +226,11 @@ router.get("/", requireAuth, async (req, res) => {
 
     if (tab === "pending") conditions.push("c.status IN ('pending', 'sent')");
     else if (tab === "completed") conditions.push("c.status = 'executed'");
-    else if (tab === "failed") conditions.push("c.status = 'failed'");
+    else if (tab === "failed") {
+      // A failed command drops off this list once a retry of it has completed.
+      conditions.push("c.status = 'failed'");
+      conditions.push("NOT EXISTS (SELECT 1 FROM commands r WHERE r.retry_of = c.id AND r.status = 'executed')");
+    }
 
     if (device_uid) {
       params.push(device_uid);
