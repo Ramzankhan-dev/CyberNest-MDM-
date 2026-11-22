@@ -413,7 +413,7 @@ router.post("/:device_uid/apps", async (req, res) => {
     const currentPackageNames = apps.map((a) => a.package_name);
     if (currentPackageNames.length > 0) {
       await pool.query(
-        `DELETE FROM device_apps WHERE device_id = $1 AND package_name != ALL($2::text[])`,
+        `DELETE FROM device_apps WHERE device_id = $1 AND status IS DISTINCT FROM 'blocked' AND package_name != ALL($2::text[])`,
         [device.id, currentPackageNames]
       );
     }
