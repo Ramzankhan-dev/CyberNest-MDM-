@@ -265,20 +265,23 @@ router.get("/apps", async (req, res) => {
   }
 });
 
-// GET /api/agent/required-apps?device_uid=   — Required apps assigned to this device
+// GET /api/agent/required-apps?device_uid=   — Required (auto-reinstall) and Locked (uninstall blocked) apps assigned to this device
 router.get("/required-apps", async (req, res) => {
   const { device_uid } = req.query;
   if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
   try {
     const result = await pool.query(
-      `SELECT a.package_name FROM applications a
+      `SELECT a.package_name, a.install_type FROM applications a
          JOIN application_assignments aa ON aa.application_id = a.id
          JOIN devices d ON d.id = aa.device_id
-        WHERE d.device_uid = $1 AND a.install_type = 'Required' AND a.status = 'active'
+        WHERE d.device_uid = $1 AND a.install_type IN ('Required', 'Locked') AND a.status = 'active'
           AND EXISTS (SELECT 1 FROM app_packages p WHERE p.organization_id = a.organization_id AND p.package_name = a.package_name)`,
       [device_uid]
     );
-    res.json({ packages: result.rows.map((r) => r.package_name) });
+    res.json({
+      packages: result.rows.filter((r) => r.install_type === "Required").map((r) => r.package_name),
+      locked: result.rows.filter((r) => r.install_type === "Locked").map((r) => r.package_name),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -306,11 +309,11 @@ router.post("/required-apps/reinstall", async (req, res) => {
       );
       const app = appRes.rows[0];
       if (!app) continue;
-      // Don't hammer: skip if any install for this app was tried in the last 5 minutes.
+      // Don't hammer: skip if any install for this app was tried in the last minute.
       const recent = await pool.query(
         `SELECT 1 FROM commands c JOIN app_packages p ON p.id = c.package_id
           WHERE c.device_id = $1 AND p.package_name = $2 AND c.command_type = 'install_app'
-            AND c.issued_at > NOW() - INTERVAL '5 minutes'`,
+            AND c.issued_at > NOW() - INTERVAL '1 minute'`,
         [device.id, pkgName]
       );
       if (recent.rows.length > 0) continue;

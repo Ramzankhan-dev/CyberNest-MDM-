@@ -17,7 +17,7 @@ const router = express.Router();
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 const CATEGORIES = ["Enterprise", "Public"];
-const INSTALL_TYPES = ["Required", "Optional"];
+const INSTALL_TYPES = ["Required", "Optional", "Locked"];
 
 function removeTempFile(file) {
   if (file && file.path) fs.promises.unlink(file.path).catch(() => {});
@@ -36,7 +36,7 @@ router.post("/", requireAuth, upload.single("apk"), async (req, res) => {
 
     const { name, package_name, version, category, install_type, organization_id } = req.body;
     if (category && !CATEGORIES.includes(category)) { removeTempFile(req.file); return res.status(400).json({ error: "Category must be Enterprise or Public" }); }
-    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required or Optional" }); }
+    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required, Optional or Locked" }); }
     const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
 
     if (!name || !name.trim()) return res.status(400).json({ error: "Application name is required" });
@@ -198,7 +198,7 @@ router.put("/:id", requireAuth, upload.single("apk"), async (req, res) => {
     const { id } = req.params;
     const { name, version, category, install_type } = req.body;
     if (category && !CATEGORIES.includes(category)) { removeTempFile(req.file); return res.status(400).json({ error: "Category must be Enterprise or Public" }); }
-    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required or Optional" }); }
+    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required, Optional or Locked" }); }
 
     const existing = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
     const current = existing.rows[0];
