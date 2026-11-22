@@ -346,6 +346,23 @@ async function latestPackage(application) {
   return r.rows[0] || null;
 }
 
+// Resolves the target devices for assign / unassign: every device in the given
+// departments (a device's department is its own, or its employee's), plus any
+// individually picked devices. Duplicates are merged.
+async function resolveTargetDevices(orgId, { device_uids, device_uid, department_ids, department_id }) {
+  const uids = [...(Array.isArray(device_uids) ? device_uids : []), ...(device_uid ? [device_uid] : [])].filter(Boolean);
+  const deptIds = [...(Array.isArray(department_ids) ? department_ids : []), ...(department_id ? [department_id] : [])]
+    .map((d) => parseInt(d, 10)).filter((d) => Number.isInteger(d));
+  const r = await pool.query(
+    `SELECT DISTINCT dv.* FROM devices dv
+     LEFT JOIN employees e ON e.device_id = dv.id
+     WHERE dv.organization_id = $1
+       AND (dv.device_uid = ANY($2::text[]) OR COALESCE(dv.department_id, e.department_id) = ANY($3::int[]))`,
+    [orgId, uids, deptIds]
+  );
+  return { devices: r.rows, requested: uids.length + deptIds.length };
+}
+
 // POST /api/applications/:id/assign   (body: { device_uid } or { department_id })
 // Records the assignment for every target device and then acts on it:
 //  - Restricted apps are blocked on the target device(s) that have them installed.
@@ -355,9 +372,6 @@ async function latestPackage(application) {
 router.post("/:id/assign", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { device_uid, department_id } = req.body;
-    if (!device_uid && !department_id) return res.status(400).json({ error: "Select at least one device or department" });
-
     const appResult = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
     const app = appResult.rows[0];
     if (!app || (!req.user.is_super_admin && app.organization_id !== req.user.organization_id)) {
@@ -365,18 +379,8 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     }
     if (app.status === "blocked") return res.status(409).json({ error: "This application is blocked — unblock it before assigning" });
 
-    let targetDevices = [];
-    if (device_uid) {
-      const d = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, app.organization_id]);
-      targetDevices = d.rows;
-    } else {
-      const d = await pool.query(
-        `SELECT DISTINCT dv.* FROM devices dv JOIN employees e ON e.device_id = dv.id
-         WHERE e.department_id = $1 AND dv.organization_id = $2`,
-        [department_id, app.organization_id]
-      );
-      targetDevices = d.rows;
-    }
+    const { devices: targetDevices, requested } = await resolveTargetDevices(app.organization_id, req.body);
+    if (requested === 0) return res.status(400).json({ error: "Select at least one device or department" });
     if (targetDevices.length === 0) return res.status(404).json({ error: "No matching devices found" });
 
     const pkg = app.category === "Restricted" ? null : await latestPackage(app);
@@ -412,6 +416,81 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     }
     if (summary.unreachable) parts.push(`${summary.unreachable} could not be reached`);
     res.json({ message: parts.join(" — "), enforced: app.category === "Restricted", command_ids: commandIds, ...summary });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/:id/assignments — devices this application is assigned to
+router.get("/:id/assignments", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appResult = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const app = appResult.rows[0];
+    if (!app || (!req.user.is_super_admin && app.organization_id !== req.user.organization_id)) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+    const result = await pool.query(
+      `SELECT dv.device_uid, dv.model, COALESCE(e.name, dv.employee_name) AS employee_name,
+              COALESCE(dv.department_id, e.department_id) AS department_id, dept.name AS department_name,
+              MIN(aa.assigned_at) AS assigned_at,
+              EXISTS (SELECT 1 FROM device_apps da WHERE da.device_id = dv.id AND da.package_name = $2) AS installed
+       FROM application_assignments aa
+       JOIN devices dv ON dv.id = aa.device_id
+       LEFT JOIN employees e ON e.device_id = dv.id
+       LEFT JOIN departments dept ON dept.id = COALESCE(dv.department_id, e.department_id)
+       WHERE aa.application_id = $1
+       GROUP BY dv.id, dv.device_uid, dv.model, e.name, dv.employee_name, dv.department_id, e.department_id, dept.name
+       ORDER BY dept.name NULLS LAST, dv.model`,
+      [id, app.package_name]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/applications/:id/unassign   (body: { device_uids?, department_ids? })
+// Removes the assignment records for the chosen devices / departments, so the
+// ASSIGNED count drops. The app itself is not uninstalled from the phones; for a
+// Restricted app (where assigning meant "block") it is unblocked again.
+router.post("/:id/unassign", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appResult = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const app = appResult.rows[0];
+    if (!app || (!req.user.is_super_admin && app.organization_id !== req.user.organization_id)) {
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    const { devices, requested } = await resolveTargetDevices(app.organization_id, req.body);
+    if (requested === 0) return res.status(400).json({ error: "Select at least one device or department" });
+
+    const ids = devices.map((d) => d.id);
+    const del = await pool.query(
+      "DELETE FROM application_assignments WHERE application_id = $1 AND device_id = ANY($2::int[]) RETURNING device_id",
+      [id, ids]
+    );
+    const removedDeviceIds = new Set(del.rows.map((r) => r.device_id));
+
+    let unblocked = 0;
+    if (app.category === "Restricted" && app.status !== "blocked") {
+      for (const device of devices) {
+        if (!removedDeviceIds.has(device.id) || !device.fcm_token) continue;
+        const installed = await pool.query("SELECT 1 FROM device_apps WHERE device_id = $1 AND package_name = $2", [device.id, app.package_name]);
+        if (installed.rows.length > 0 && (await sendAppCommand(device, "unblock_app", app.package_name, req.user.id, req))) unblocked++;
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_unassigned", status: "success", req, details: `${app.name} -> ${removedDeviceIds.size} device(s)` });
+    res.json({
+      message: removedDeviceIds.size === 0
+        ? "Nothing to unassign — those devices were not assigned"
+        : `Unassigned from ${removedDeviceIds.size} device(s)${unblocked ? ` — unblocked on ${unblocked}` : ""}`,
+      removed: removedDeviceIds.size,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
