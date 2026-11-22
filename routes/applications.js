@@ -287,16 +287,20 @@ async function recordAssignment(applicationId, deviceId, userId) {
 
 // Pushes the silent APK install to one device.
 // Returns { ok: true, command_id } or { ok: false, code, error }.
-async function pushInstall(application, pkg, device, userId, req) {
+async function pushInstall(application, pkg, device, userId, req, { force = false } = {}) {
   if (!device.fcm_token) return { ok: false, code: 409, error: "Device is not enrolled yet" };
 
-  const alreadyInstalled = await pool.query(
-    `SELECT 1 FROM app_installs WHERE app_package_id = $1 AND device_id = $2
-     UNION ALL SELECT 1 FROM device_apps WHERE device_id = $2 AND package_name = $3`,
-    [pkg.id, device.id, pkg.package_name]
-  );
-  if (alreadyInstalled.rows.length > 0) {
-    return { ok: false, code: 409, already: true, error: `"${pkg.app_name}" is already installed on this device` };
+  // Bulk assignment skips devices that already reported the app. An explicit
+  // single-device install (force) doesn't trust that record, since the app may
+  // have been removed from the phone by hand after the last report.
+  if (!force) {
+    const alreadyInstalled = await pool.query(
+      "SELECT 1 FROM device_apps WHERE device_id = $1 AND package_name = $2",
+      [device.id, pkg.package_name]
+    );
+    if (alreadyInstalled.rows.length > 0) {
+      return { ok: false, code: 409, already: true, error: `"${pkg.app_name}" is already installed on this device` };
+    }
   }
 
   const inProgress = await pool.query(
@@ -377,6 +381,7 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
 
     const pkg = app.category === "Restricted" ? null : await latestPackage(app);
     const summary = { installs_sent: 0, already_installed: 0, blocked: 0, unreachable: 0 };
+    const commandIds = [];
 
     for (const device of targetDevices) {
       await recordAssignment(app.id, device.id, req.user.id);
@@ -388,7 +393,7 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
         }
       } else if (pkg) {
         const r = await pushInstall(app, pkg, device, req.user.id, req);
-        if (r.ok) summary.installs_sent++;
+        if (r.ok) { summary.installs_sent++; commandIds.push(r.command_id); }
         else if (r.already) summary.already_installed++;
         else summary.unreachable++;
       }
@@ -406,7 +411,7 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
       if (summary.already_installed) parts.push(`already installed / in progress on ${summary.already_installed}`);
     }
     if (summary.unreachable) parts.push(`${summary.unreachable} could not be reached`);
-    res.json({ message: parts.join(" — "), enforced: app.category === "Restricted", ...summary });
+    res.json({ message: parts.join(" — "), enforced: app.category === "Restricted", command_ids: commandIds, ...summary });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -539,7 +544,7 @@ router.post("/:id/install", requireAuth, async (req, res) => {
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Device not found" });
 
-    const result = await pushInstall(application, pkg, device, req.user.id, req);
+    const result = await pushInstall(application, pkg, device, req.user.id, req, { force: true });
     if (!result.ok) return res.status(result.code).json({ error: result.error });
     res.json({ message: `Install command sent to ${device.model || device.device_uid}`, command_id: result.command_id });
   } catch (err) {
