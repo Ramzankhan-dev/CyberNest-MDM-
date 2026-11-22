@@ -274,4 +274,27 @@ router.get("/", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/notifications/requests — requests coming FROM devices (unenroll request,
+// support ticket). They are also kept in the audit log; this feed shows them in the
+// Notification center and drives the dashboard pop-up. Organization Admin only.
+const DEVICE_REQUEST_LABELS = {
+  device_unenroll_requested: "Unenroll request",
+  support_ticket_created: "Support ticket",
+};
+router.get("/requests", requireAuth, async (req, res) => {
+  try {
+    if (req.user.is_super_admin || req.user.role !== "OrganizationAdmin") return res.json({ requests: [] });
+    const result = await pool.query(
+      `SELECT id, action, details, created_at FROM audit_logs
+        WHERE organization_id = $1 AND action = ANY($2::text[])
+        ORDER BY id DESC LIMIT 50`,
+      [req.user.organization_id, Object.keys(DEVICE_REQUEST_LABELS)]
+    );
+    res.json({ requests: result.rows.map((r) => ({ ...r, type: DEVICE_REQUEST_LABELS[r.action] })) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 module.exports = router;
