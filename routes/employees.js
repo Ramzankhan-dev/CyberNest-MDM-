@@ -479,13 +479,21 @@ router.patch("/:id/department", requireAuth, blockSuperAdmin, async (req, res) =
     if (!dept || dept.organization_id !== empOrgId) return res.status(400).json({ error: "Department not found" });
     if (dept.status !== "active") return res.status(400).json({ error: "Department is not active" });
 
-    // A Department Manager stays in the department they manage — change their role first to move them.
-    const empRow = (await pool.query("SELECT role, department_id FROM employees WHERE id = $1", [id])).rows[0];
-    if (empRow && empRow.role === "DepartmentManager" && String(empRow.department_id) !== String(department_id)) {
-      return res.status(409).json({ error: "This employee is a Department Manager — change their role first before moving them to another department" });
+    // A Department Manager can only move to a department that has no manager yet;
+    // the manager role then moves with them (1 department : 1 manager).
+    const empRow = (await pool.query("SELECT role, department_id, linked_user_id FROM employees WHERE id = $1", [id])).rows[0];
+    const movingManager = empRow && empRow.role === "DepartmentManager" && String(empRow.department_id) !== String(department_id);
+    if (movingManager) {
+      if (dept.manager_id || dept.manager_employee_id) {
+        return res.status(409).json({ error: "That department already has a Department Manager" });
+      }
+      await pool.query("UPDATE departments SET manager_id = NULL, manager_employee_id = NULL WHERE manager_employee_id = $1 OR (manager_id IS NOT NULL AND manager_id = $2)", [id, empRow.linked_user_id]);
     }
 
     const result = await pool.query("UPDATE employees SET department_id = $1 WHERE id = $2 RETURNING *", [department_id, id]);
+    if (movingManager) {
+      await pool.query("UPDATE departments SET manager_id = $1, manager_employee_id = $2 WHERE id = $3", [empRow.linked_user_id, id, department_id]);
+    }
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_department_changed", status: "success", req });
     res.json({ message: "Department changed", employee: result.rows[0] });
