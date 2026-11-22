@@ -453,7 +453,7 @@ const ENTITIES = {
     defaultColumns: ["organization", "name", "package_name", "category", "status", "assigned_devices"],
     filters: {
       status: { label: "Status", expr: "a.status", options: ["active", "blocked"] },
-      category: { label: "Category", expr: "a.category", options: ["Enterprise", "Public", "Restricted"] },
+      category: { label: "Category", expr: "a.category", options: ["Enterprise", "Public"] },
     },
   },
 };

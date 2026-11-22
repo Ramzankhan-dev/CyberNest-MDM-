@@ -4,6 +4,8 @@ const logAudit = require("../utils/auditLog");
 const computeStatus = require("../utils/computeCompliance");
 const { getEffectivePolicyByUid } = require("../utils/policyCommands");
 
+const applicationsRouter = require("./applications");
+
 const router = express.Router();
 
 // This file holds agent-facing endpoints (no dashboard login — the
@@ -257,6 +259,68 @@ router.get("/apps", async (req, res) => {
       : `SELECT package_name, COALESCE(app_name, package_name) AS app_name, status FROM device_apps WHERE device_id = $1 AND status IS DISTINCT FROM 'blocked' ORDER BY app_name`;
     const result = await pool.query(query, [device.id]);
     res.json({ apps: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/agent/required-apps?device_uid=   — Required apps assigned to this device
+router.get("/required-apps", async (req, res) => {
+  const { device_uid } = req.query;
+  if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+  try {
+    const result = await pool.query(
+      `SELECT a.package_name FROM applications a
+         JOIN application_assignments aa ON aa.application_id = a.id
+         JOIN devices d ON d.id = aa.device_id
+        WHERE d.device_uid = $1 AND a.install_type = 'Required' AND a.status = 'active'
+          AND EXISTS (SELECT 1 FROM app_packages p WHERE p.organization_id = a.organization_id AND p.package_name = a.package_name)`,
+      [device_uid]
+    );
+    res.json({ packages: result.rows.map((r) => r.package_name) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/agent/required-apps/reinstall   { device_uid, package_names: [...] }
+// The device reports Required apps it no longer has (user uninstalled them);
+// the backend pushes the install again.
+router.post("/required-apps/reinstall", async (req, res) => {
+  const { device_uid, package_names } = req.body || {};
+  if (!device_uid || !Array.isArray(package_names)) return res.status(400).json({ error: "device_uid and package_names are required" });
+  try {
+    const dev = await pool.query("SELECT id, device_uid, fcm_token FROM devices WHERE device_uid = $1", [device_uid]);
+    const device = dev.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    let sent = 0;
+    for (const pkgName of package_names) {
+      const appRes = await pool.query(
+        `SELECT a.*, aa.assigned_by FROM applications a
+           JOIN application_assignments aa ON aa.application_id = a.id AND aa.device_id = $1
+          WHERE a.package_name = $2 AND a.install_type = 'Required' AND a.status = 'active' LIMIT 1`,
+        [device.id, pkgName]
+      );
+      const app = appRes.rows[0];
+      if (!app) continue;
+      // Don't hammer: skip if any install for this app was tried in the last 5 minutes.
+      const recent = await pool.query(
+        `SELECT 1 FROM commands c JOIN app_packages p ON p.id = c.package_id
+          WHERE c.device_id = $1 AND p.package_name = $2 AND c.command_type = 'install_app'
+            AND c.issued_at > NOW() - INTERVAL '5 minutes'`,
+        [device.id, pkgName]
+      );
+      if (recent.rows.length > 0) continue;
+      const pkg = await applicationsRouter.latestPackage(app);
+      if (!pkg) continue;
+      await pool.query("DELETE FROM device_apps WHERE device_id = $1 AND package_name = $2", [device.id, pkgName]);
+      const r = await applicationsRouter.pushInstall(app, pkg, device, app.assigned_by, req, { force: true });
+      if (r.ok) sent++;
+    }
+    res.json({ reinstall_sent: sent });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

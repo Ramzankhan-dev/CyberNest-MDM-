@@ -16,6 +16,9 @@ const router = express.Router();
 // 150MB covers real-world APK sizes with headroom.
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 150 * 1024 * 1024 } });
 
+const CATEGORIES = ["Enterprise", "Public"];
+const INSTALL_TYPES = ["Required", "Optional"];
+
 function removeTempFile(file) {
   if (file && file.path) fs.promises.unlink(file.path).catch(() => {});
 }
@@ -32,6 +35,8 @@ router.post("/", requireAuth, upload.single("apk"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "APK file is required" });
 
     const { name, package_name, version, category, install_type, organization_id } = req.body;
+    if (category && !CATEGORIES.includes(category)) { removeTempFile(req.file); return res.status(400).json({ error: "Category must be Enterprise or Public" }); }
+    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required or Optional" }); }
     const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
 
     if (!name || !name.trim()) return res.status(400).json({ error: "Application name is required" });
@@ -192,20 +197,36 @@ router.put("/:id", requireAuth, upload.single("apk"), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, version, category, install_type } = req.body;
+    if (category && !CATEGORIES.includes(category)) { removeTempFile(req.file); return res.status(400).json({ error: "Category must be Enterprise or Public" }); }
+    if (install_type && !INSTALL_TYPES.includes(install_type)) { removeTempFile(req.file); return res.status(400).json({ error: "Install type must be Required or Optional" }); }
 
     const existing = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
     const current = existing.rows[0];
     if (!current) return res.status(404).json({ error: "Application not found" });
 
     let info = null;
+    let corrected = null;
     if (req.file) {
       try {
         info = await readApkInfo(req.file.path);
       } catch (err) {
         return res.status(400).json({ error: "Could not read this file — please upload a valid .apk" });
       }
+      if (!info.packageName || !isValidPackage(info.packageName)) {
+        return res.status(400).json({ error: "Could not read a package name from this APK" });
+      }
+      // The APK's own package name is the truth. If the stored name differs (it
+      // was typed by hand before APKs were verified), correct the record — unless
+      // another application already uses the real name.
       if (info.packageName !== current.package_name) {
-        return res.status(400).json({ error: `Package name mismatch: the uploaded APK belongs to '${info.packageName}', not '${current.package_name}'` });
+        const clash = await pool.query(
+          "SELECT 1 FROM applications WHERE organization_id = $1 AND package_name = $2 AND id <> $3",
+          [current.organization_id, info.packageName, id]
+        );
+        if (clash.rows.length > 0) {
+          return res.status(409).json({ error: `This APK belongs to '${info.packageName}', which another application already uses — delete or edit that one first` });
+        }
+        corrected = { from: current.package_name, to: info.packageName };
       }
     }
 
@@ -217,6 +238,17 @@ router.put("/:id", requireAuth, upload.single("apk"), async (req, res) => {
       [name && name.trim() ? name.trim() : null, versionToStore, category, install_type, id]
     );
     const app = result.rows[0];
+
+    if (corrected) {
+      await pool.query("UPDATE applications SET package_name = $1 WHERE id = $2", [corrected.to, id]);
+      await pool.query("UPDATE app_packages SET package_name = $1 WHERE organization_id = $2 AND package_name = $3", [corrected.to, app.organization_id, corrected.from]);
+      // Rows reported under the wrong name don't describe real apps — drop them.
+      await pool.query(
+        "DELETE FROM device_apps WHERE package_name = $1 AND device_id IN (SELECT id FROM devices WHERE organization_id = $2)",
+        [corrected.from, app.organization_id]
+      );
+      app.package_name = corrected.to;
+    }
 
     if (req.file) {
       const apkData = await fs.promises.readFile(req.file.path);
@@ -236,7 +268,10 @@ router.put("/:id", requireAuth, upload.single("apk"), async (req, res) => {
     }
 
     await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_updated", status: "success", req });
-    res.json({ message: "Application updated", application: app });
+    res.json({
+      message: corrected ? `Application updated — package name corrected from ${corrected.from} to ${corrected.to}` : "Application updated",
+      application: app,
+    });
   } catch (err) {
     console.error(err);
     if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
@@ -365,7 +400,6 @@ async function resolveTargetDevices(orgId, { device_uids, device_uid, department
 
 // POST /api/applications/:id/assign   (body: { device_uid } or { department_id })
 // Records the assignment for every target device and then acts on it:
-//  - Restricted apps are blocked on the target device(s) that have them installed.
 //  - Any other app gets its APK pushed (silent install) to each target device
 //    that doesn't have it yet. A department resolves to every device whose
 //    employee belongs to that department.
@@ -383,19 +417,14 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     if (requested === 0) return res.status(400).json({ error: "Select at least one device or department" });
     if (targetDevices.length === 0) return res.status(404).json({ error: "No matching devices found" });
 
-    const pkg = app.category === "Restricted" ? null : await latestPackage(app);
-    const summary = { installs_sent: 0, already_installed: 0, blocked: 0, unreachable: 0 };
+    const pkg = await latestPackage(app);
+    const summary = { installs_sent: 0, already_installed: 0, unreachable: 0 };
     const commandIds = [];
 
     for (const device of targetDevices) {
       await recordAssignment(app.id, device.id, req.user.id);
 
-      if (app.category === "Restricted") {
-        const installed = await pool.query("SELECT 1 FROM device_apps WHERE device_id = $1 AND package_name = $2", [device.id, app.package_name]);
-        if (installed.rows.length > 0 && device.fcm_token) {
-          (await sendAppCommand(device, "block_app", app.package_name, req.user.id, req)) ? summary.blocked++ : summary.unreachable++;
-        }
-      } else if (pkg) {
+      if (pkg) {
         const r = await pushInstall(app, pkg, device, req.user.id, req);
         if (r.ok) { summary.installs_sent++; commandIds.push(r.command_id); }
         else if (r.already) summary.already_installed++;
@@ -406,16 +435,14 @@ router.post("/:id/assign", requireAuth, async (req, res) => {
     await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_assigned", status: "success", req, details: `${app.name} -> ${targetDevices.length} device(s)` });
 
     const parts = [`Assigned to ${targetDevices.length} device(s)`];
-    if (app.category === "Restricted") {
-      parts.push(`block sent to ${summary.blocked}`);
-    } else if (!pkg) {
+    if (!pkg) {
       parts.push("no APK stored for this application, so nothing was installed");
     } else {
       parts.push(`install sent to ${summary.installs_sent}`);
       if (summary.already_installed) parts.push(`already installed / in progress on ${summary.already_installed}`);
     }
     if (summary.unreachable) parts.push(`${summary.unreachable} could not be reached`);
-    res.json({ message: parts.join(" — "), enforced: app.category === "Restricted", command_ids: commandIds, ...summary });
+    res.json({ message: parts.join(" — "), command_ids: commandIds, ...summary });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -454,8 +481,7 @@ router.get("/:id/assignments", requireAuth, async (req, res) => {
 
 // POST /api/applications/:id/unassign   (body: { device_uids?, department_ids? })
 // Removes the assignment records for the chosen devices / departments, so the
-// ASSIGNED count drops. The app itself is not uninstalled from the phones; for a
-// Restricted app (where assigning meant "block") it is unblocked again.
+// ASSIGNED count drops. The app itself is not uninstalled from the phones.
 router.post("/:id/unassign", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -475,20 +501,11 @@ router.post("/:id/unassign", requireAuth, async (req, res) => {
     );
     const removedDeviceIds = new Set(del.rows.map((r) => r.device_id));
 
-    let unblocked = 0;
-    if (app.category === "Restricted" && app.status !== "blocked") {
-      for (const device of devices) {
-        if (!removedDeviceIds.has(device.id) || !device.fcm_token) continue;
-        const installed = await pool.query("SELECT 1 FROM device_apps WHERE device_id = $1 AND package_name = $2", [device.id, app.package_name]);
-        if (installed.rows.length > 0 && (await sendAppCommand(device, "unblock_app", app.package_name, req.user.id, req))) unblocked++;
-      }
-    }
-
     await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_unassigned", status: "success", req, details: `${app.name} -> ${removedDeviceIds.size} device(s)` });
     res.json({
       message: removedDeviceIds.size === 0
         ? "Nothing to unassign — those devices were not assigned"
-        : `Unassigned from ${removedDeviceIds.size} device(s)${unblocked ? ` — unblocked on ${unblocked}` : ""}`,
+        : `Unassigned from ${removedDeviceIds.size} device(s)`,
       removed: removedDeviceIds.size,
     });
   } catch (err) {
@@ -657,5 +674,9 @@ router.get("/packages/installs", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// Used by routes/agent.js (Required-app auto reinstall)
+router.pushInstall = pushInstall;
+router.latestPackage = latestPackage;
 
 module.exports = router;
