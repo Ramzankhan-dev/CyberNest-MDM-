@@ -582,12 +582,17 @@ router.patch("/:id/assign-device", requireAuth, requireRole("OrganizationAdmin",
     }
 
     const deviceResult = await pool.query(
-      "SELECT id FROM devices WHERE device_uid = $1 AND organization_id = $2",
+      "SELECT id, department_id FROM devices WHERE device_uid = $1 AND organization_id = $2",
       [device_uid, empOrgId]
     );
     const device = deviceResult.rows[0];
     if (!device) {
       return res.status(404).json({ error: "Device not found in this organization" });
+    }
+    // A Department Manager may only use unassigned devices from the global pool (no department)
+    // or from their own department — never another department's device.
+    if (req.user.role === "DepartmentManager" && device.department_id && String(device.department_id) !== String(employee.department_id)) {
+      return res.status(403).json({ error: "That device belongs to another department" });
     }
 
     // BR-04: one device can only be assigned to one employee at a time
