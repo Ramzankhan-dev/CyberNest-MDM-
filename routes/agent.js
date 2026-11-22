@@ -194,7 +194,7 @@ router.post("/sync", async (req, res) => {
     );
     const policyName = policyResult.rows[0]?.name || null;
 
-    const appsResult = await pool.query("SELECT COUNT(*) FROM device_apps WHERE device_id = $1", [device.id]);
+    const appsResult = await pool.query("SELECT COUNT(*) FROM device_apps WHERE device_id = $1 AND status IS DISTINCT FROM 'blocked'", [device.id]);
     const appsCount = parseInt(appsResult.rows[0].count, 10);
 
     await pool.query("UPDATE devices SET last_seen = NOW() WHERE id = $1", [device.id]);
@@ -253,8 +253,8 @@ router.get("/apps", async (req, res) => {
     if (!device) return res.status(404).json({ error: "Device not found" });
 
     const query = blocked_only === "true"
-      ? `SELECT package_name, app_name, status FROM device_apps WHERE device_id = $1 AND status = 'blocked' ORDER BY app_name`
-      : `SELECT package_name, app_name, status FROM device_apps WHERE device_id = $1 ORDER BY app_name`;
+      ? `SELECT package_name, COALESCE(app_name, package_name) AS app_name, status FROM device_apps WHERE device_id = $1 AND status = 'blocked' ORDER BY app_name`
+      : `SELECT package_name, COALESCE(app_name, package_name) AS app_name, status FROM device_apps WHERE device_id = $1 AND status IS DISTINCT FROM 'blocked' ORDER BY app_name`;
     const result = await pool.query(query, [device.id]);
     res.json({ apps: result.rows });
   } catch (err) {
