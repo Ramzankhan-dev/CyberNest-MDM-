@@ -413,7 +413,7 @@ router.post("/:device_uid/apps", async (req, res) => {
     const currentPackageNames = apps.map((a) => a.package_name);
     if (currentPackageNames.length > 0) {
       await pool.query(
-        `DELETE FROM device_apps WHERE device_id = $1 AND status IS DISTINCT FROM 'blocked' AND package_name != ALL($2::text[])`,
+        `DELETE FROM device_apps WHERE device_id = $1 AND package_name != ALL($2::text[])`,
         [device.id, currentPackageNames]
       );
     }
@@ -645,10 +645,18 @@ router.delete("/:device_uid", requireAuth, blockSuperAdmin, async (req, res) => 
 router.post("/:device_uid/geofence", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { device_uid } = req.params;
-    const { lat, lng, radius_meters } = req.body;
-    if (lat == null || lng == null || !radius_meters) {
+    const { lat, lng } = req.body;
+    if (lat == null || lng == null || !req.body.radius_meters) {
       return res.status(400).json({ error: "lat, lng, and radius_meters are required" });
     }
+    // Small radii (15-50m) are allowed on purpose so geofence alerts can be
+    // demonstrated without walking 100m+; accuracy below ~100m depends on
+    // GPS/Wi-Fi (the dashboard shows a warning).
+    const latNum = Number(lat), lngNum = Number(lng), radiusNum = Number(req.body.radius_meters);
+    if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90) return res.status(400).json({ error: "Latitude must be between -90 and 90" });
+    if (!Number.isFinite(lngNum) || lngNum < -180 || lngNum > 180) return res.status(400).json({ error: "Longitude must be between -180 and 180" });
+    if (!Number.isFinite(radiusNum) || radiusNum < 1 || radiusNum > 100000) return res.status(400).json({ error: "Radius must be between 1 and 100000 meters" });
+    const radius_meters = Math.round(radiusNum);
 
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, req.user.organization_id]);
     const device = deviceResult.rows[0];
