@@ -31,7 +31,7 @@ router.get("/", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT DISTINCT ON (dv.id)
               dv.id, dv.device_uid, dv.model, dv.last_seen, dv.employee_name,
-              e.name AS assigned_employee_name, dept.id AS department_id, dept.name AS department_name,
+              e.name AS assigned_employee_name, e.role AS employee_role, dept.id AS department_id, dept.name AS department_name,
               pol.policy_id, pol.policy_name, pol.policy_version, pol.assigned_at
        FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
@@ -69,6 +69,8 @@ router.get("/", requireAuth, async (req, res) => {
       const complianceStatus = computed === "Unknown" ? "No Policy" : computed;
       if (status && complianceStatus.toLowerCase().replace(" ", "-") !== status) continue;
       if (department_id && String(device.department_id) !== String(department_id)) continue;
+      // A Department Manager's own device is handled by the Organization Admin only.
+      if (req.user.role === "DepartmentManager" && device.employee_role === "DepartmentManager") continue;
       if (search) {
         const s = search.toLowerCase();
         const haystack = `${device.model} ${device.device_uid} ${device.assigned_employee_name || device.employee_name || ""}`.toLowerCase();
@@ -123,7 +125,7 @@ router.get("/summary", requireAuth, async (req, res) => {
          ) x
        ) pol ON TRUE
        WHERE dv.organization_id = $1 AND COALESCE(dv.status, '') <> 'pending'
-         ${managedDeptId ? "AND COALESCE(dv.department_id, e.department_id) = $2" : ""}
+         ${managedDeptId ? "AND COALESCE(dv.department_id, e.department_id) = $2 AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')" : ""}
        ORDER BY dv.id`,
       managedDeptId ? [orgId, managedDeptId] : [orgId]
     );

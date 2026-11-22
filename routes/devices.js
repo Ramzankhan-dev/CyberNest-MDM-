@@ -139,6 +139,8 @@ router.get("/", requireAuth, async (req, res) => {
       conditions.push(`(dv.employee_name ILIKE $${params.length} OR dv.device_uid ILIKE $${params.length} OR dv.model ILIKE $${params.length} OR dv.imei ILIKE $${params.length} OR e.name ILIKE $${params.length} OR d.name ILIKE $${params.length})`);
     }
     if (req.user.role === "DepartmentManager") {
+      // The device held by a Department Manager is managed by the Organization Admin only.
+      conditions.push("NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')");
       // A Department Manager only ever sees devices bound to their own
       // department (whether an employee has been assigned yet or not)
       // plus the truly-global unassigned pool — never another

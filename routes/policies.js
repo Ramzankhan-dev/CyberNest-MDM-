@@ -376,7 +376,7 @@ router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "Depart
     if (!isActive(policy)) return res.status(400).json({ error: "This policy is disabled. Enable it before assigning." });
 
     const deviceResult = await pool.query(
-      `SELECT dv.*, e.department_id AS employee_department_id FROM devices dv
+      `SELECT dv.*, e.department_id AS employee_department_id, e.role AS employee_role FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
        WHERE dv.device_uid = $1 AND dv.organization_id = $2`,
       [device_uid, policy.organization_id]
@@ -391,6 +391,9 @@ router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "Depart
       const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
       if (!managedDeptId || device.employee_department_id !== managedDeptId) {
         return res.status(403).json({ error: "You can only manage devices in your own department" });
+      }
+      if (device.employee_role === "DepartmentManager") {
+        return res.status(403).json({ error: "This device can only be managed by the Organization Admin" });
       }
     }
 

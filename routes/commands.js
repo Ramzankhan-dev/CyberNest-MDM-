@@ -60,7 +60,7 @@ router.post("/send", requireAuth, requireRole("OrganizationAdmin", "DepartmentMa
     const results = [];
     for (const uid of targets) {
       const deviceResult = await pool.query(
-        `SELECT dv.*, e.department_id AS employee_department_id FROM devices dv
+        `SELECT dv.*, e.department_id AS employee_department_id, e.role AS employee_role FROM devices dv
          LEFT JOIN employees e ON e.device_id = dv.id
          WHERE dv.device_uid = $1 AND dv.organization_id = $2`,
         [uid, req.user.organization_id]
@@ -72,6 +72,10 @@ router.post("/send", requireAuth, requireRole("OrganizationAdmin", "DepartmentMa
       }
       if (req.user.role === "DepartmentManager" && (!managedDeptId || device.employee_department_id !== managedDeptId)) {
         results.push({ device_uid: uid, error: "You can only manage devices in your own department" });
+        continue;
+      }
+      if (req.user.role === "DepartmentManager" && device.employee_role === "DepartmentManager") {
+        results.push({ device_uid: uid, error: "This device can only be managed by the Organization Admin" });
         continue;
       }
       if (!device.fcm_token) {

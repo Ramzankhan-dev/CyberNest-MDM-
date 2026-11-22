@@ -28,7 +28,7 @@ router.get("/summary", requireAuth, async (req, res) => {
     } else if (roleName === "DepartmentManager") {
       const managedDeptResult = await pool.query("SELECT id FROM departments WHERE manager_id = $1", [req.user.id]);
       const managedDeptId = managedDeptResult.rows[0]?.id || 0; // 0 never matches — an unassigned manager sees all-zero stats
-      deviceWhere = "dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2";
+      deviceWhere = "dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2 AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')"; // the manager's own device is Organization Admin only
       deviceParams.push(req.user.organization_id, managedDeptId);
       // Policies aren't department-scoped (a department manager applies
       // org-wide policies, doesn't own any) — count stays at the org level.
@@ -127,7 +127,7 @@ router.get("/charts", requireAuth, async (req, res) => {
     } else if (roleName === "DepartmentManager") {
       const managedDeptResult = await pool.query("SELECT id FROM departments WHERE manager_id = $1", [req.user.id]);
       managedDeptId = managedDeptResult.rows[0]?.id || 0;
-      deviceWhere = "dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2";
+      deviceWhere = "dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2 AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')"; // the manager's own device is Organization Admin only
       deviceParams.push(req.user.organization_id, managedDeptId);
     }
     // SuperAdmin: no filter — true system-wide chart data.
