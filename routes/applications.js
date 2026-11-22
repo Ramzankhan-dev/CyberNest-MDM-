@@ -1,44 +1,99 @@
 const express = require("express");
+const fs = require("fs");
+const os = require("os");
 const multer = require("multer");
 const pool = require("../config/db");
 const admin = require("../config/firebase");
 const requireAuth = require("../middleware/auth");
 const logAudit = require("../utils/auditLog");
+const { readApkInfo } = require("../utils/apkInfo");
 
 const router = express.Router();
-// APKs are held in memory only long enough to write them into the
-// app_packages.apk_data column — never written to local disk (Render's
-// filesystem is ephemeral, so on-disk storage wouldn't survive a
-// redeploy anyway). 150MB covers real-world APK sizes with headroom.
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
+// The uploaded APK is written to a temporary file first so its manifest
+// can be inspected, then stored in app_packages.apk_data (Render's disk is
+// ephemeral, so the DB is the real storage). The temp file is always
+// removed afterwards, whether the upload succeeded or was rejected.
+// 150MB covers real-world APK sizes with headroom.
+const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 150 * 1024 * 1024 } });
+
+function removeTempFile(file) {
+  if (file && file.path) fs.promises.unlink(file.path).catch(() => {});
+}
 
 function isValidPackage(pkg) {
   return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(pkg);
 }
 
-// POST /api/applications   (SRS-012 FR-01/02)
-router.post("/", requireAuth, async (req, res) => {
+// POST /api/applications   (multipart: apk file + name, package_name?, version?, category, install_type)
+// One flow for adding an application: the APK is required, its real package
+// name is read from the APK manifest, and the record + APK are saved together.
+router.post("/", requireAuth, upload.single("apk"), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: "APK file is required" });
+
     const { name, package_name, version, category, install_type, organization_id } = req.body;
     const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
 
     if (!name || !name.trim()) return res.status(400).json({ error: "Application name is required" });
-    if (!package_name || !isValidPackage(package_name)) return res.status(400).json({ error: "Package name is invalid" });
+    const entered = (package_name || "").trim();
+    if (entered && !isValidPackage(entered)) return res.status(400).json({ error: "Package name is invalid" });
 
-    const dup = await pool.query("SELECT id FROM applications WHERE organization_id = $1 AND package_name = $2", [orgId, package_name]);
-    if (dup.rows.length > 0) return res.status(409).json({ error: "Package already exists" });
+    let info;
+    try {
+      info = await readApkInfo(req.file.path);
+    } catch (err) {
+      return res.status(400).json({ error: "Could not read this file — please upload a valid .apk" });
+    }
+    if (!info.packageName || !isValidPackage(info.packageName)) {
+      return res.status(400).json({ error: "Could not read a package name from this APK" });
+    }
+    if (entered && entered !== info.packageName) {
+      return res.status(400).json({ error: `Package name mismatch: the uploaded APK belongs to '${info.packageName}', not '${entered}'` });
+    }
+    const pkgName = info.packageName;
 
-    const result = await pool.query(
-      `INSERT INTO applications (organization_id, name, package_name, version, category, install_type)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [orgId, name.trim(), package_name, version || null, category || "Public", install_type || "Optional"]
+    const dup = await pool.query(
+      `SELECT 1 FROM applications WHERE organization_id = $1 AND package_name = $2
+       UNION ALL
+       SELECT 1 FROM app_packages WHERE organization_id = $1 AND package_name = $2`,
+      [orgId, pkgName]
     );
+    if (dup.rows.length > 0) return res.status(409).json({ error: "This package already exists" });
 
-    await logAudit({ userId: req.user.id, organizationId: orgId, action: "application_registered", status: "success", req, details: package_name });
-    res.status(201).json({ message: "Application registered", application: result.rows[0] });
+    const versionToStore = (version && version.trim()) || info.versionName || null;
+    const apkData = await fs.promises.readFile(req.file.path);
+
+    const client = await pool.connect();
+    let application;
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO app_packages (organization_id, app_name, package_name, version_name, file_size_bytes, apk_data)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [orgId, name.trim(), pkgName, versionToStore, req.file.size, apkData]
+      );
+      const result = await client.query(
+        `INSERT INTO applications (organization_id, name, package_name, version, category, install_type)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [orgId, name.trim(), pkgName, versionToStore, category || "Public", install_type || "Optional"]
+      );
+      await client.query("COMMIT");
+      application = result.rows[0];
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "application_registered", status: "success", req, details: pkgName });
+    res.status(201).json({ message: "Application added", application });
   } catch (err) {
     console.error(err);
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
     res.status(500).json({ error: "Server error" });
+  } finally {
+    removeTempFile(req.file);
   }
 });
 
@@ -73,8 +128,14 @@ router.get("/", requireAuth, async (req, res) => {
       `SELECT a.*,
               (SELECT COUNT(DISTINCT device_id) FROM application_assignments aa WHERE aa.application_id = a.id) AS assigned_devices_count,
               (SELECT COUNT(DISTINCT da.device_id) FROM device_apps da JOIN devices dv ON da.device_id = dv.id
-                WHERE da.package_name = a.package_name AND dv.organization_id = a.organization_id) AS installed_count
+                WHERE da.package_name = a.package_name AND dv.organization_id = a.organization_id) AS installed_count,
+              pk.id AS package_id, pk.file_size_bytes, pk.uploaded_at AS apk_uploaded_at
        FROM applications a
+       LEFT JOIN LATERAL (
+         SELECT p.id, p.file_size_bytes, p.uploaded_at FROM app_packages p
+         WHERE p.organization_id = a.organization_id AND p.package_name = a.package_name
+         ORDER BY p.uploaded_at DESC LIMIT 1
+       ) pk ON TRUE
        WHERE ${conditions.join(" AND ")}
        ORDER BY a.created_at DESC
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -108,7 +169,7 @@ router.get("/stats", requireAuth, async (req, res) => {
     );
     const pending = await pool.query(
       `SELECT COUNT(*) FROM commands c JOIN devices d ON c.device_id = d.id
-       WHERE d.organization_id = $1 AND c.command_type IN ('block_app', 'unblock_app') AND c.status = 'sent'`,
+       WHERE d.organization_id = $1 AND c.command_type IN ('block_app', 'unblock_app', 'install_app') AND c.status IN ('pending', 'sent')`,
       [orgId]
     );
 
@@ -126,23 +187,62 @@ router.get("/stats", requireAuth, async (req, res) => {
   }
 });
 
-// PUT /api/applications/:id
-router.put("/:id", requireAuth, async (req, res) => {
+// PUT /api/applications/:id   (multipart, optional apk — attaches / replaces the APK)
+router.put("/:id", requireAuth, upload.single("apk"), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, version, category, install_type } = req.body;
+
+    const existing = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const current = existing.rows[0];
+    if (!current) return res.status(404).json({ error: "Application not found" });
+
+    let info = null;
+    if (req.file) {
+      try {
+        info = await readApkInfo(req.file.path);
+      } catch (err) {
+        return res.status(400).json({ error: "Could not read this file — please upload a valid .apk" });
+      }
+      if (info.packageName !== current.package_name) {
+        return res.status(400).json({ error: `Package name mismatch: the uploaded APK belongs to '${info.packageName}', not '${current.package_name}'` });
+      }
+    }
+
+    const versionToStore = (version && version.trim()) || (info && info.versionName) || null;
     const result = await pool.query(
       `UPDATE applications SET name = COALESCE($1, name), version = COALESCE($2, version),
         category = COALESCE($3, category), install_type = COALESCE($4, install_type), updated_at = NOW()
        WHERE id = $5 RETURNING *`,
-      [name, version, category, install_type, id]
+      [name && name.trim() ? name.trim() : null, versionToStore, category, install_type, id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Application not found" });
-    await logAudit({ userId: req.user.id, organizationId: result.rows[0].organization_id, action: "application_updated", status: "success", req });
-    res.json({ message: "Application updated", application: result.rows[0] });
+    const app = result.rows[0];
+
+    if (req.file) {
+      const apkData = await fs.promises.readFile(req.file.path);
+      // Update the stored APK in place so install history stays attached to it.
+      const upd = await pool.query(
+        `UPDATE app_packages SET app_name = $1, version_name = $2, file_size_bytes = $3, apk_data = $4, uploaded_at = NOW()
+         WHERE id = (SELECT id FROM app_packages WHERE organization_id = $5 AND package_name = $6 ORDER BY uploaded_at DESC LIMIT 1)`,
+        [app.name, app.version, req.file.size, apkData, app.organization_id, app.package_name]
+      );
+      if (upd.rowCount === 0) {
+        await pool.query(
+          `INSERT INTO app_packages (organization_id, app_name, package_name, version_name, file_size_bytes, apk_data)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [app.organization_id, app.name, app.package_name, app.version, req.file.size, apkData]
+        );
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_updated", status: "success", req });
+    res.json({ message: "Application updated", application: app });
   } catch (err) {
     console.error(err);
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
     res.status(500).json({ error: "Server error" });
+  } finally {
+    removeTempFile(req.file);
   }
 });
 
@@ -250,21 +350,34 @@ router.patch("/:id/allow", requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/applications/:id
+// DELETE /api/applications/:id  — also removes the stored APK for it
 router.delete("/:id", requireAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const existing = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const existing = await client.query("SELECT * FROM applications WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Application not found" });
+    const app = existing.rows[0];
 
-    await pool.query("DELETE FROM application_assignments WHERE application_id = $1", [id]);
-    await pool.query("DELETE FROM applications WHERE id = $1", [id]);
+    await client.query("BEGIN");
+    await client.query("DELETE FROM application_assignments WHERE application_id = $1", [id]);
+    await client.query(
+      `UPDATE commands SET package_id = NULL
+       WHERE package_id IN (SELECT id FROM app_packages WHERE organization_id = $1 AND package_name = $2)`,
+      [app.organization_id, app.package_name]
+    );
+    await client.query("DELETE FROM app_packages WHERE organization_id = $1 AND package_name = $2", [app.organization_id, app.package_name]);
+    await client.query("DELETE FROM applications WHERE id = $1", [id]);
+    await client.query("COMMIT");
 
-    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "application_deleted", status: "success", req });
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_deleted", status: "success", req });
     res.json({ message: "Application deleted" });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error(err);
     res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
   }
 });
 
@@ -276,83 +389,33 @@ router.delete("/:id", requireAuth, async (req, res) => {
 // and installs via the Device Owner's PackageInstaller API, which
 // needs nothing beyond what's already set up).
 
-// POST /api/applications/packages   (multipart: apk file + app_name, package_name, version_name)
-router.post("/packages", requireAuth, upload.single("apk"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "APK file is required" });
-    const { app_name, package_name, version_name } = req.body;
-    if (!app_name || !app_name.trim()) return res.status(400).json({ error: "App name is required" });
-    if (!package_name || !isValidPackage(package_name)) return res.status(400).json({ error: "Package name is invalid" });
-
-    const orgId = req.user.organization_id;
-    const result = await pool.query(
-      `INSERT INTO app_packages (organization_id, app_name, package_name, version_name, file_size_bytes, apk_data)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, app_name, package_name, version_name, file_size_bytes, uploaded_at`,
-      [orgId, app_name.trim(), package_name.trim(), version_name || null, req.file.size, req.file.buffer]
-    );
-
-    await logAudit({ userId: req.user.id, organizationId: orgId, action: "app_package_uploaded", status: "success", req, details: `${app_name} (${package_name})` });
-    res.status(201).json({ message: "APK uploaded", package: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// GET /api/applications/packages   — metadata only, never the blob
-router.get("/packages", requireAuth, async (req, res) => {
-  try {
-    const orgId = req.user.is_super_admin ? (req.query.organization_id || req.user.organization_id) : req.user.organization_id;
-    const result = await pool.query(
-      `SELECT id, app_name, package_name, version_name, file_size_bytes, uploaded_at
-       FROM app_packages WHERE organization_id = $1 ORDER BY uploaded_at DESC`,
-      [orgId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// DELETE /api/applications/packages/:id
-router.delete("/packages/:id", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const existing = await pool.query("SELECT organization_id, app_name FROM app_packages WHERE id = $1", [id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Package not found" });
-    if (!req.user.is_super_admin && existing.rows[0].organization_id !== req.user.organization_id) {
-      return res.status(404).json({ error: "Package not found" });
-    }
-    await pool.query("DELETE FROM app_packages WHERE id = $1", [id]);
-    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "app_package_deleted", status: "success", req, details: existing.rows[0].app_name });
-    res.json({ message: "Package deleted" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// POST /api/applications/packages/:id/install   (body: { device_uid })
-// Sends a "install_app" FCM command carrying a download URL — the
+// POST /api/applications/:id/install   (body: { device_uid })
+// :id is the application's id. Sends an "install_app" FCM command — the
 // device fetches the APK from GET /api/agent/apps/packages/:id/download
 // (agent-facing, in routes/agent.js) and installs it silently via
 // PackageInstaller, which Device Owner apps can do without a user
 // confirmation dialog.
-router.post("/packages/:id/install", requireAuth, async (req, res) => {
+router.post("/:id/install", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { device_uid } = req.body;
     if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
 
-    const pkgResult = await pool.query("SELECT * FROM app_packages WHERE id = $1", [id]);
-    const pkg = pkgResult.rows[0];
-    if (!pkg) return res.status(404).json({ error: "Package not found" });
-    if (!req.user.is_super_admin && pkg.organization_id !== req.user.organization_id) {
-      return res.status(404).json({ error: "Package not found" });
+    const appResult = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const application = appResult.rows[0];
+    if (!application || (!req.user.is_super_admin && application.organization_id !== req.user.organization_id)) {
+      return res.status(404).json({ error: "Application not found" });
     }
+    if (application.status === "blocked") {
+      return res.status(409).json({ error: "This application is blocked — allow it before installing" });
+    }
+
+    const pkgResult = await pool.query(
+      "SELECT * FROM app_packages WHERE organization_id = $1 AND package_name = $2 ORDER BY uploaded_at DESC LIMIT 1",
+      [application.organization_id, application.package_name]
+    );
+    const pkg = pkgResult.rows[0];
+    if (!pkg) return res.status(409).json({ error: "No APK is stored for this application — edit it and upload an APK first" });
 
     const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, pkg.organization_id]);
     const device = deviceResult.rows[0];
