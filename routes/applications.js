@@ -325,17 +325,13 @@ async function recordAssignment(applicationId, deviceId, userId) {
 async function pushInstall(application, pkg, device, userId, req, { force = false } = {}) {
   if (!device.fcm_token) return { ok: false, code: 409, error: "Device is not enrolled yet" };
 
-  // Bulk assignment skips devices that already reported the app. An explicit
-  // single-device install (force) doesn't trust that record, since the app may
-  // have been removed from the phone by hand after the last report.
-  if (!force) {
-    const alreadyInstalled = await pool.query(
-      "SELECT 1 FROM device_apps WHERE device_id = $1 AND package_name = $2",
-      [device.id, pkg.package_name]
-    );
-    if (alreadyInstalled.rows.length > 0) {
-      return { ok: false, code: 409, already: true, error: `"${pkg.app_name}" is already installed on this device` };
-    }
+  // Check first: is the app already on this device (matched by package name or app name)?
+  const alreadyInstalled = await pool.query(
+    "SELECT 1 FROM device_apps WHERE device_id = $1 AND (package_name = $2 OR LOWER(app_name) = LOWER($3)) LIMIT 1",
+    [device.id, pkg.package_name, pkg.app_name]
+  );
+  if (alreadyInstalled.rows.length > 0) {
+    return { ok: false, code: 409, already: true, error: `"${pkg.app_name}" is already installed on this device` };
   }
 
   const inProgress = await pool.query(

@@ -319,7 +319,7 @@ router.post("/required-apps/reinstall", async (req, res) => {
       if (recent.rows.length > 0) continue;
       const pkg = await applicationsRouter.latestPackage(app);
       if (!pkg) continue;
-      await pool.query("DELETE FROM device_apps WHERE device_id = $1 AND package_name = $2", [device.id, pkgName]);
+      await pool.query("DELETE FROM device_apps WHERE device_id = $1 AND (package_name = $2 OR LOWER(app_name) = LOWER($3))", [device.id, pkgName, pkg.app_name]);
       const r = await applicationsRouter.pushInstall(app, pkg, device, app.assigned_by, req, { force: true });
       if (r.ok) sent++;
     }
