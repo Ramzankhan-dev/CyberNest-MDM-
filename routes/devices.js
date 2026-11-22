@@ -7,7 +7,9 @@ const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles
 
 const logAudit = require("../utils/auditLog");
 const admin = require("../config/firebase");
-const { getDevicePolicies, mergePolicies, buildUnblockDiff, getEffectivePolicyByUid } = require("../utils/policyCommands");
+const { getDevicePolicies, mergePolicies, pushView, buildCommandsForPolicy, buildUnblockDiff, getEffectivePolicyByUid } = require("../utils/policyCommands");
+const { cleanImei } = require("../utils/imei");
+const { resolveImeiForDevice } = require("../utils/imeiDedupe");
 
 const router = express.Router();
 
@@ -73,10 +75,10 @@ router.post("/confirm", async (req, res) => {
 
     const result = await pool.query(
       `UPDATE devices
-       SET imei = $1, model = $2, android_version = $3, fcm_token = $4,
+       SET imei = COALESCE($1, imei), model = $2, android_version = $3, fcm_token = $4,
            status = 'online', last_seen = NOW()
        WHERE device_uid = $5 RETURNING *`,
-      [imei, model, android_version, fcm_token, device_uid]
+      [cleanImei(imei), model, android_version, fcm_token, device_uid]
     );
 
     const device = result.rows[0];
@@ -106,7 +108,11 @@ router.post("/confirm", async (req, res) => {
               await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [cmdLog.rows[0].id]);
             } catch (e) { /* best-effort — enrollment still succeeds either way */ }
           }
-          await pool.query("INSERT INTO device_policies (device_id, policy_id) VALUES ($1, $2)", [device.id, policy.id]);
+          await pool.query(
+            `INSERT INTO device_policies (device_id, policy_id)
+             SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM device_policies WHERE device_id = $1 AND policy_id = $2)`,
+            [device.id, policy.id]
+          );
         }
       }
     }
@@ -233,6 +239,26 @@ router.get("/stats", requireAuth, async (req, res) => {
   }
 });
 
+// Conflict notices are throttled: a heartbeat arrives every 30s, the audit log needs one entry, not hundreds.
+const imeiConflictLoggedAt = new Map();
+
+// After a re-enrollment was merged into an old row, the wiped phone has none of its
+// restrictions any more — send the policies assigned to that row again.
+async function repushAssignedPolicies(device) {
+  if (!device.fcm_token) return;
+  const effective = mergePolicies(await getDevicePolicies(pool, device.id));
+  for (const cmd of buildCommandsForPolicy(pushView(effective))) {
+    try {
+      const log = await pool.query(
+        `INSERT INTO commands (device_id, command_type, status) VALUES ($1, $2, 'pending') RETURNING *`,
+        [device.id, cmd.type]
+      );
+      await admin.messaging().send({ token: device.fcm_token, data: { command: cmd.type, command_id: String(log.rows[0].id), ...(cmd.extra || {}) } });
+      await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [log.rows[0].id]);
+    } catch (e) { /* best-effort */ }
+  }
+}
+
 // PATCH /api/devices/:device_uid/heartbeat   (Called periodically by the agent app)
 // Keeps last_seen, battery, and status fresh so the dashboard shows live data.
 router.patch("/:device_uid/heartbeat", async (req, res) => {
@@ -251,6 +277,37 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
       is_rooted,
     } = req.body;
 
+    const found = await pool.query("SELECT * FROM devices WHERE device_uid = $1", [device_uid]);
+    if (found.rows.length === 0) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+    let device = found.rows[0];
+
+    // Only a real 15-digit IMEI is stored ("Not available" etc. are ignored).
+    // A new IMEI is checked against the other devices first, so the same phone
+    // never ends up listed twice.
+    let imeiToStore = null;
+    let imeiNotice = null;
+    const realImei = cleanImei(imei);
+    if (realImei && realImei !== device.imei) {
+      const outcome = await resolveImeiForDevice(pool, device, realImei);
+      if (outcome.action === "set") {
+        imeiToStore = realImei;
+      } else if (outcome.action === "merged") {
+        device = outcome.device;
+        imeiToStore = realImei;
+        await logAudit({ organizationId: device.organization_id, action: "device_re_enrolled", status: "success", req, details: `${outcome.previousUid} -> ${device.device_uid} (same IMEI, existing record reused)` });
+        repushAssignedPolicies(device).catch(() => {});
+      } else {
+        imeiNotice = outcome.message;
+        const last = imeiConflictLoggedAt.get(device_uid) || 0;
+        if (Date.now() - last > 60 * 60 * 1000) {
+          imeiConflictLoggedAt.set(device_uid, Date.now());
+          await logAudit({ organizationId: device.organization_id, action: "device_imei_conflict", status: "failed", req, details: `${device_uid}: ${outcome.message}` });
+        }
+      }
+    }
+
     const result = await pool.query(
       `UPDATE devices
        SET status = 'online',
@@ -265,15 +322,11 @@ router.patch("/:device_uid/heartbeat", async (req, res) => {
            network_info = COALESCE($9, network_info),
            is_rooted = COALESCE($10, is_rooted),
            last_seen = NOW()
-       WHERE device_uid = $11 RETURNING *`,
-      [battery_level, fcm_token, manufacturer, device_identifier, imei, ram_gb, storage_total_gb, storage_used_gb, network_info, is_rooted, device_uid]
+       WHERE id = $11 RETURNING *`,
+      [battery_level, fcm_token, manufacturer, device_identifier, imeiToStore, ram_gb, storage_total_gb, storage_used_gb, network_info, is_rooted, device.id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Device not found" });
-    }
-
-    res.json({ message: "Heartbeat received", device: result.rows[0] });
+    res.json({ message: "Heartbeat received", device: result.rows[0], ...(imeiNotice ? { imei_conflict: imeiNotice } : {}) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
