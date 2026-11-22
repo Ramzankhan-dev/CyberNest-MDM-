@@ -148,11 +148,21 @@ router.get("/", requireAuth, async (req, res) => {
       // department_id filter the request asked for, rather than
       // trusting the client to only ever ask for their own.
       const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
-      if (managedDeptId) {
+      const deptExpr = "COALESCE(dv.department_id, e.department_id)";
+      if (department_id === "unassigned") {
+        conditions.push(`${deptExpr} IS NULL`); // the Unassigned card: only the global pool
+      } else if (department_id) {
+        if (managedDeptId && String(department_id) === String(managedDeptId)) {
+          params.push(managedDeptId);
+          conditions.push(`${deptExpr} = $${params.length}`); // own department card: only own department
+        } else {
+          conditions.push("1 = 0"); // any other department: nothing
+        }
+      } else if (managedDeptId) {
         params.push(managedDeptId);
-        conditions.push(`(COALESCE(dv.department_id, e.department_id) = $${params.length} OR COALESCE(dv.department_id, e.department_id) IS NULL)`);
+        conditions.push(`(${deptExpr} = $${params.length} OR ${deptExpr} IS NULL)`); // no card chosen: own + pool (e.g. device pickers)
       } else {
-        conditions.push("COALESCE(dv.department_id, e.department_id) IS NULL"); // not managing any department yet — sees only unassigned
+        conditions.push(`${deptExpr} IS NULL`); // not managing any department yet — sees only unassigned
       }
     } else if (department_id === "unassigned") {
       conditions.push("COALESCE(dv.department_id, e.department_id) IS NULL");

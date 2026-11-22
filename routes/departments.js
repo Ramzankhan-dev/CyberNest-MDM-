@@ -1,7 +1,7 @@
 const express = require("express");
 const pool = require("../config/db");
 const requireAuth = require("../middleware/auth");
-const { blockSuperAdmin } = require("../middleware/roles");
+const { blockSuperAdmin, getManagedDepartmentId } = require("../middleware/roles");
 const logAudit = require("../utils/auditLog");
 
 const router = express.Router();
@@ -75,6 +75,16 @@ router.get("/", requireAuth, async (req, res) => {
       conditions.push(`d.status = $${params.length}`);
     }
 
+    // A Department Manager only sees their own department, and its device count
+    // leaves out the manager's own device (that one is Organization Admin only).
+    let deviceExtra = "";
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = await getManagedDepartmentId(pool, req.user.id);
+      params.push(managedDeptId || 0);
+      conditions.push(`d.id = $${params.length}`);
+      deviceExtra = " AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')";
+    }
+
     let orderBy = "d.created_at DESC";
     if (sort === "name") orderBy = "d.name ASC";
     else if (sort === "employee_count") orderBy = "employee_count DESC";
@@ -87,8 +97,8 @@ router.get("/", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT d.*, p.name AS policy_name, mgr.name AS manager_name,
               (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id) AS employee_count,
-              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id) AS device_count,
-              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
+              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id${deviceExtra}) AS device_count,
+              (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id${deviceExtra} AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
        FROM departments d
        LEFT JOIN policies p ON d.default_policy_id = p.id
        LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id
