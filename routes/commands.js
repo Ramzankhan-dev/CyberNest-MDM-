@@ -45,6 +45,21 @@ async function dispatchCommand(device, commandType, issuedBy, packageName, req) 
   }
 }
 
+// A Department Manager only works with commands of devices in their own department
+// (their own device is Organization Admin only). Returns false when the manager may not access this device.
+async function managerCanAccessDevice(req, deviceId) {
+  if (req.user.role !== "DepartmentManager") return true;
+  const deptId = await getManagedDepartmentId(pool, req.user.id);
+  if (!deptId) return false;
+  const r = await pool.query(
+    `SELECT 1 FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+      WHERE dv.id = $1 AND COALESCE(dv.department_id, e.department_id) = $2
+        AND NOT EXISTS (SELECT 1 FROM employees m WHERE m.device_id = dv.id AND m.role = 'DepartmentManager')`,
+    [deviceId, deptId]
+  );
+  return r.rows.length > 0;
+}
+
 // POST /api/commands/send   (Admin only) — FR-01: supports one or many devices
 // Body: { device_uid: "..." } OR { device_uids: ["...", "..."] }, command_type, package_name?
 router.post("/send", requireAuth, requireRole("OrganizationAdmin", "DepartmentManager"), async (req, res) => {
@@ -154,6 +169,10 @@ router.post("/:id/ack", async (req, res) => {
 router.patch("/:id/cancel", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    const owner = await pool.query("SELECT device_id FROM commands WHERE id = $1", [id]);
+    if (owner.rows[0] && !(await managerCanAccessDevice(req, owner.rows[0].device_id))) {
+      return res.status(403).json({ error: "You can only manage commands of devices in your own department" });
+    }
     const result = await pool.query(
       `UPDATE commands c SET status = 'cancelled'
        FROM devices d WHERE c.id = $1 AND c.device_id = d.id AND d.organization_id = $2 AND c.status = 'pending'
@@ -183,6 +202,7 @@ router.post("/:id/retry", requireAuth, blockSuperAdmin, async (req, res) => {
     );
     const cmd = original.rows[0];
     if (!cmd) return res.status(404).json({ error: "Command not found" });
+    if (!(await managerCanAccessDevice(req, cmd.device_id))) return res.status(403).json({ error: "You can only manage commands of devices in your own department" });
     if (cmd.status !== "failed") return res.status(409).json({ error: "Only failed commands can be retried" });
     if (!cmd.fcm_token) return res.status(400).json({ error: "This device has no FCM token yet" });
 
@@ -210,6 +230,7 @@ router.post("/:id/resend", requireAuth, blockSuperAdmin, async (req, res) => {
     );
     const cmd = original.rows[0];
     if (!cmd) return res.status(404).json({ error: "Command not found" });
+    if (!(await managerCanAccessDevice(req, cmd.device_id))) return res.status(403).json({ error: "You can only manage commands of devices in your own department" });
     if (cmd.status !== "executed") return res.status(409).json({ error: "Only completed commands can be resent" });
     if (PACKAGE_COMMANDS.includes(cmd.command_type)) {
       return res.status(400).json({ error: "App commands can't be resent from here — send them again from the Applications page" });
@@ -234,6 +255,13 @@ router.get("/", requireAuth, async (req, res) => {
     const { tab, device_uid, department_id, command_type, search, date_from, date_to, page = 1, limit = 50 } = req.query;
     const conditions = ["d.organization_id = $1"];
     const params = [req.user.organization_id];
+
+    if (req.user.role === "DepartmentManager") {
+      const managedDeptId = (await getManagedDepartmentId(pool, req.user.id)) || 0;
+      params.push(managedDeptId);
+      conditions.push(`COALESCE(d.department_id, e.department_id) = $${params.length}`);
+      conditions.push("NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = d.id AND mgr_e.role = 'DepartmentManager')");
+    }
 
     if (tab === "pending") conditions.push("c.status IN ('pending', 'sent')");
     else if (tab === "completed") conditions.push("c.status = 'executed'");
@@ -307,13 +335,14 @@ router.get("/:device_uid", requireAuth, async (req, res) => {
   try {
     const { device_uid } = req.params;
     const result = await pool.query(
-      `SELECT c.* FROM commands c
+      `SELECT c.*, d.id AS device_row_id FROM commands c
        JOIN devices d ON c.device_id = d.id
        WHERE d.device_uid = $1 AND d.organization_id = $2
        ORDER BY c.issued_at DESC`,
       [device_uid, req.user.organization_id]
     );
-    res.json(result.rows);
+    if (result.rows.length > 0 && !(await managerCanAccessDevice(req, result.rows[0].device_row_id))) return res.json([]);
+    res.json(result.rows.map(({ device_row_id, ...row }) => row));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -337,6 +366,8 @@ router.get("/:id/status", requireAuth, async (req, res) => {
     if (!req.user.is_super_admin && command.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Command not found" });
     }
+    const dev = await pool.query("SELECT device_id FROM commands WHERE id = $1", [id]);
+    if (dev.rows[0] && !(await managerCanAccessDevice(req, dev.rows[0].device_id))) return res.status(404).json({ error: "Command not found" });
     res.json(command);
   } catch (err) {
     console.error(err);
