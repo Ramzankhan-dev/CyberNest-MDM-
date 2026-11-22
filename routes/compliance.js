@@ -26,19 +26,30 @@ router.get("/", requireAuth, async (req, res) => {
       department_id = managedDeptId;
     }
 
+    // A device can carry several policies: every ACTIVE one is listed (comma separated)
+    // and disabled policies are ignored. Devices that never enrolled (pending) are left out.
     const result = await pool.query(
       `SELECT DISTINCT ON (dv.id)
               dv.id, dv.device_uid, dv.model, dv.last_seen, dv.employee_name,
               e.name AS assigned_employee_name, dept.id AS department_id, dept.name AS department_name,
-              p.id AS policy_id, p.name AS policy_name, p.version AS policy_version,
-              dp.assigned_at
+              pol.policy_id, pol.policy_name, pol.policy_version, pol.assigned_at
        FROM devices dv
-       LEFT JOIN device_policies dp ON dp.device_id = dv.id
-       LEFT JOIN policies p ON dp.policy_id = p.id
        LEFT JOIN employees e ON e.device_id = dv.id
        LEFT JOIN departments dept ON dept.id = COALESCE(dv.department_id, e.department_id)
-       WHERE dv.organization_id = $1
-       ORDER BY dv.id, dp.assigned_at DESC`,
+       LEFT JOIN LATERAL (
+         SELECT (array_agg(x.id ORDER BY x.assigned_at DESC))[1] AS policy_id,
+                string_agg(x.name, ', ' ORDER BY x.assigned_at) AS policy_name,
+                string_agg(COALESCE(x.version::text, '—'), ', ' ORDER BY x.assigned_at) AS policy_version,
+                MAX(x.assigned_at) AS assigned_at
+         FROM (
+           SELECT p.id, p.name, p.version, MAX(dp.assigned_at) AS assigned_at
+           FROM device_policies dp JOIN policies p ON p.id = dp.policy_id
+           WHERE dp.device_id = dv.id AND COALESCE(p.status, 'active') = 'active'
+           GROUP BY p.id, p.name, p.version
+         ) x
+       ) pol ON TRUE
+       WHERE dv.organization_id = $1 AND COALESCE(dv.status, '') <> 'pending'
+       ORDER BY dv.id`,
       [orgId]
     );
 
@@ -86,48 +97,58 @@ router.get("/summary", requireAuth, async (req, res) => {
     if (req.user.role === "DepartmentManager") {
       managedDeptId = await getManagedDepartmentId(pool, req.user.id);
       if (!managedDeptId) {
-        return res.json({ total_devices: 0, compliant_devices: 0, non_compliant_devices: 0, pending_sync: 0, failed_policies: 0, compliance_percentage: 0 });
+        return res.json({ total_devices: 0, compliant_devices: 0, non_compliant_devices: 0, pending_sync: 0, failed_policies: 0, unassigned_devices: 0, compliance_percentage: 0 });
       }
     }
 
     const result = await pool.query(
       `SELECT DISTINCT ON (dv.id)
               dv.id, dv.last_seen,
-              dp.assigned_at, p.id AS policy_id
+              pol.assigned_at, pol.policy_id
        FROM devices dv
-       LEFT JOIN device_policies dp ON dp.device_id = dv.id
-       LEFT JOIN policies p ON dp.policy_id = p.id
        LEFT JOIN employees e ON e.device_id = dv.id
-       WHERE dv.organization_id = $1
+       LEFT JOIN LATERAL (
+         SELECT (array_agg(x.id ORDER BY x.assigned_at DESC))[1] AS policy_id,
+                string_agg(x.name, ', ' ORDER BY x.assigned_at) AS policy_name,
+                string_agg(COALESCE(x.version::text, '—'), ', ' ORDER BY x.assigned_at) AS policy_version,
+                MAX(x.assigned_at) AS assigned_at
+         FROM (
+           SELECT p.id, p.name, p.version, MAX(dp.assigned_at) AS assigned_at
+           FROM device_policies dp JOIN policies p ON p.id = dp.policy_id
+           WHERE dp.device_id = dv.id AND COALESCE(p.status, 'active') = 'active'
+           GROUP BY p.id, p.name, p.version
+         ) x
+       ) pol ON TRUE
+       WHERE dv.organization_id = $1 AND COALESCE(dv.status, '') <> 'pending'
          ${managedDeptId ? "AND COALESCE(dv.department_id, e.department_id) = $2" : ""}
-       ORDER BY dv.id, dp.assigned_at DESC`,
+       ORDER BY dv.id`,
       managedDeptId ? [orgId, managedDeptId] : [orgId]
     );
 
-    let compliant = 0, nonCompliant = 0, pendingSync = 0, failed = 0;
+    // Devices without any active policy are counted separately ("No Policy") and are
+    // not part of Total / Compliance %, which only covers devices that should be compliant.
+    let compliant = 0, nonCompliant = 0, pendingSync = 0, failed = 0, noPolicy = 0;
     for (const device of result.rows) {
-      let latestFailed = false;
-      if (device.policy_id) {
-        const failCheck = await pool.query(
-          `SELECT id FROM commands WHERE device_id = $1 AND status = 'failed' AND issued_at > $2 LIMIT 1`,
-          [device.id, device.assigned_at || new Date(0)]
-        );
-        latestFailed = failCheck.rows.length > 0;
-      }
-      const s = computeStatus(device, latestFailed);
+      if (!device.policy_id) { noPolicy++; continue; }
+      const failCheck = await pool.query(
+        `SELECT id FROM commands WHERE device_id = $1 AND status = 'failed' AND issued_at > $2 LIMIT 1`,
+        [device.id, device.assigned_at || new Date(0)]
+      );
+      const s = computeStatus(device, failCheck.rows.length > 0);
       if (s === "Compliant") compliant++;
       else if (s === "Non-Compliant") nonCompliant++;
       else if (s === "Pending Sync") pendingSync++;
       else if (s === "Policy Failed") failed++;
     }
 
-    const total = result.rows.length;
+    const total = result.rows.length - noPolicy;
     res.json({
       total_devices: total,
       compliant_devices: compliant,
       non_compliant_devices: nonCompliant,
       pending_sync: pendingSync,
       failed_policies: failed,
+      unassigned_devices: noPolicy,
       compliance_percentage: total > 0 ? Math.round((compliant / total) * 100) : 0,
     });
   } catch (err) {
