@@ -479,6 +479,12 @@ router.patch("/:id/department", requireAuth, blockSuperAdmin, async (req, res) =
     if (!dept || dept.organization_id !== empOrgId) return res.status(400).json({ error: "Department not found" });
     if (dept.status !== "active") return res.status(400).json({ error: "Department is not active" });
 
+    // A Department Manager stays in the department they manage — change their role first to move them.
+    const empRow = (await pool.query("SELECT role, department_id FROM employees WHERE id = $1", [id])).rows[0];
+    if (empRow && empRow.role === "DepartmentManager" && String(empRow.department_id) !== String(department_id)) {
+      return res.status(409).json({ error: "This employee is a Department Manager — change their role first before moving them to another department" });
+    }
+
     const result = await pool.query("UPDATE employees SET department_id = $1 WHERE id = $2 RETURNING *", [department_id, id]);
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_department_changed", status: "success", req });
