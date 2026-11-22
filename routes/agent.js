@@ -48,7 +48,7 @@ router.get("/dashboard", async (req, res) => {
     let latestFailed = false;
     if (device.policy_id) {
       const failCheck = await pool.query(
-        `SELECT id FROM commands WHERE device_id = $1 AND status = 'failed' AND issued_at > $2 LIMIT 1`,
+        `SELECT c.id FROM commands c WHERE c.device_id = $1 AND c.status = 'failed' AND c.issued_at > $2 AND NOT EXISTS (SELECT 1 FROM commands c2 WHERE c2.device_id = c.device_id AND c2.command_type = c.command_type AND c2.status = 'executed' AND c2.issued_at > c.issued_at) LIMIT 1`,
         [device.id, device.assigned_at || new Date(0)]
       );
       latestFailed = failCheck.rows.length > 0;

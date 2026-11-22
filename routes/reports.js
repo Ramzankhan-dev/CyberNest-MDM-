@@ -28,6 +28,7 @@ const DEVICE_CTE = `
           SELECT 1 FROM commands c
           WHERE c.device_id = x.id AND c.status = 'failed'
             AND c.issued_at > COALESCE(x.assigned_at, TIMESTAMP 'epoch')
+            AND NOT EXISTS (SELECT 1 FROM commands c2 WHERE c2.device_id = c.device_id AND c2.command_type = c.command_type AND c2.status = 'executed' AND c2.issued_at > c.issued_at)
         ) THEN 'Policy Failed'
         WHEN x.last_seen IS NULL OR x.last_seen < x.assigned_at THEN 'Pending Sync'
         WHEN x.last_seen > NOW() - INTERVAL '90 seconds' THEN 'Compliant'
