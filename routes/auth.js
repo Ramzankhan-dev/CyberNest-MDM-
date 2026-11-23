@@ -117,6 +117,15 @@ router.post("/login", loginRateLimiter, async (req, res) => {
       return res.status(403).json({ error: "Your organization has been suspended. Contact CyberNest support." });
     }
 
+    // A Department Manager cannot log in while the department they manage is disabled.
+    if (user.role_name === "DepartmentManager") {
+      const dept = await pool.query("SELECT status FROM departments WHERE manager_id = $1", [user.id]);
+      if (dept.rows[0] && dept.rows[0].status !== "active") {
+        await logAudit({ userId: user.id, organizationId: user.organization_id, action: "login_failed", status: "failure", req, details: "Department disabled" });
+        return res.status(403).json({ error: "This department is disabled. Contact your Organization Admin." });
+      }
+    }
+
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       return res.status(429).json({ error: `Too many failed attempts. Try again after ${new Date(user.locked_until).toLocaleTimeString()}.` });
     }

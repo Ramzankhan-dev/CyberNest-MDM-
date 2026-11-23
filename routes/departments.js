@@ -212,8 +212,31 @@ router.delete("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
     if (parseInt(empCount.rows[0].count) > 0) {
       return res.status(409).json({ error: "Cannot delete a department with employees assigned. Reassign or remove them first." });
     }
+    const devCount = await pool.query(
+      `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE dv.department_id = $1 OR e.department_id = $1`,
+      [id]
+    );
+    if (parseInt(devCount.rows[0].count) > 0) {
+      return res.status(409).json({ error: "Cannot delete a department with devices linked to it. Move or remove them first." });
+    }
 
-    const result = await pool.query("UPDATE departments SET status = 'disabled' WHERE id = $1 RETURNING *", [id]);
+    // Permanently remove the department (clearing the few settings that merely point at it).
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM notifications WHERE target_department_id = $1", [id]);
+      await client.query("UPDATE enrollment_profiles SET default_department_id = NULL WHERE default_department_id = $1", [id]);
+      await client.query("UPDATE organization_settings SET default_department_id = NULL WHERE default_department_id = $1", [id]);
+      await client.query("DELETE FROM departments WHERE id = $1", [id]);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      if (e.code === "23503") return res.status(409).json({ error: "This department is still referenced by other records and cannot be deleted." });
+      throw e;
+    } finally {
+      client.release();
+    }
 
     await logAudit({ userId: req.user.id, organizationId: dept.organization_id, action: "department_deleted", status: "success", req });
     res.json({ message: "Department deleted" });

@@ -33,6 +33,19 @@ async function requireAuth(req, res, next) {
     }
   }
 
+  // A Department Manager loses dashboard access as soon as their department is disabled.
+  if (decoded.role === "DepartmentManager") {
+    try {
+      const dept = await pool.query("SELECT status FROM departments WHERE manager_id = $1", [decoded.id]);
+      if (dept.rows[0] && dept.rows[0].status !== "active") {
+        return res.status(403).json({ error: "This department is disabled. Contact your Organization Admin." });
+      }
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+
   req.user = decoded; // { id, email, role }
   next();
 }
