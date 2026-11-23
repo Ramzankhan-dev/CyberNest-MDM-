@@ -256,6 +256,19 @@ router.get("/activity", requireAuth, async (req, res) => {
         device_uid: null,
       })));
     }
+    if (req.user.role === "DepartmentManager") {
+      // Manager sees only commands for their own department's devices.
+      const managedDeptId = (await pool.query("SELECT id FROM departments WHERE manager_id = $1", [req.user.id])).rows[0]?.id || 0;
+      const scoped = await pool.query(
+        `SELECT c.id, c.command_type, c.status, c.issued_at, dv.employee_name, dv.device_uid
+         FROM commands c JOIN devices dv ON c.device_id = dv.id
+         LEFT JOIN employees e ON e.device_id = dv.id
+         WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2 AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')
+         ORDER BY c.issued_at DESC LIMIT 20`,
+        [req.user.organization_id, managedDeptId]
+      );
+      return res.json(scoped.rows);
+    }
     const result = await pool.query(
       `SELECT c.id, c.command_type, c.status, c.issued_at, d.employee_name, d.device_uid
        FROM commands c JOIN devices d ON c.device_id = d.id
@@ -290,7 +303,18 @@ router.get("/alerts", requireAuth, async (req, res) => {
         message: r.details ? `${r.action} — ${r.details}` : r.action,
       })));
     }
-    const result = await pool.query("SELECT * FROM devices WHERE organization_id = $1", [req.user.organization_id]);
+    let result;
+    if (req.user.role === "DepartmentManager") {
+      // Manager sees alerts only for their own department's devices.
+      const managedDeptId = (await pool.query("SELECT id FROM departments WHERE manager_id = $1", [req.user.id])).rows[0]?.id || 0;
+      result = await pool.query(
+        `SELECT dv.* FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+         WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) = $2 AND NOT EXISTS (SELECT 1 FROM employees mgr_e WHERE mgr_e.device_id = dv.id AND mgr_e.role = 'DepartmentManager')`,
+        [req.user.organization_id, managedDeptId]
+      );
+    } else {
+      result = await pool.query("SELECT * FROM devices WHERE organization_id = $1", [req.user.organization_id]);
+    }
     const devices = result.rows;
     const alerts = [];
 
