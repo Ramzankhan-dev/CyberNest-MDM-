@@ -96,11 +96,6 @@ async function createOrAttachManagerAccount(pool, { employeeId, departmentId, fu
 
   await pool.query("UPDATE departments SET manager_id = $1 WHERE id = $2", [userId, departmentId]);
   await pool.query("UPDATE employees SET linked_user_id = $1 WHERE id = $2", [userId, employeeId]);
-  // Keeps the pre-existing manager_employee_id label field (set via
-  // the Departments module's own "Set Manager" UI) pointed at the
-  // same person, so the two "who manages this department" fields
-  // don't quietly diverge.
-  await pool.query("UPDATE departments SET manager_employee_id = $1 WHERE id = $2", [employeeId, departmentId]);
   return userId;
 }
 
@@ -114,7 +109,6 @@ async function detachManagerAccount(pool, employeeId) {
   if (!linkedUserId) return;
 
   await pool.query("UPDATE departments SET manager_id = NULL WHERE manager_id = $1", [linkedUserId]);
-  await pool.query("UPDATE departments SET manager_employee_id = NULL WHERE manager_employee_id = $1", [employeeId]);
   await pool.query("UPDATE users SET status = 'suspended' WHERE id = $1", [linkedUserId]);
 }
 
@@ -165,7 +159,7 @@ router.get("/profile", requireEmployeeAuth, async (req, res) => {
 });
 
 async function getDepartmentAnyOrg(departmentId) {
-  const result = await pool.query("SELECT id, status, organization_id, manager_id, manager_employee_id, default_policy_id FROM departments WHERE id = $1", [departmentId]);
+  const result = await pool.query("SELECT id, status, organization_id, manager_id, default_policy_id FROM departments WHERE id = $1", [departmentId]);
   return result.rows[0] || null;
 }
 
@@ -486,15 +480,17 @@ router.patch("/:id/department", requireAuth, blockSuperAdmin, async (req, res) =
     const empRow = (await pool.query("SELECT role, department_id, linked_user_id FROM employees WHERE id = $1", [id])).rows[0];
     const movingManager = empRow && empRow.role === "DepartmentManager" && String(empRow.department_id) !== String(department_id);
     if (movingManager) {
-      if (dept.manager_id || dept.manager_employee_id) {
+      if (dept.manager_id) {
         return res.status(409).json({ error: "That department already has a Department Manager" });
       }
-      await pool.query("UPDATE departments SET manager_id = NULL, manager_employee_id = NULL WHERE manager_employee_id = $1 OR (manager_id IS NOT NULL AND manager_id = $2)", [id, empRow.linked_user_id]);
+      if (empRow.linked_user_id) {
+        await pool.query("UPDATE departments SET manager_id = NULL WHERE manager_id = $1", [empRow.linked_user_id]);
+      }
     }
 
     const result = await pool.query("UPDATE employees SET department_id = $1 WHERE id = $2 RETURNING *", [department_id, id]);
     if (movingManager) {
-      await pool.query("UPDATE departments SET manager_id = $1, manager_employee_id = $2 WHERE id = $3", [empRow.linked_user_id, id, department_id]);
+      await pool.query("UPDATE departments SET manager_id = $1 WHERE id = $2", [empRow.linked_user_id, department_id]);
     }
 
     // The employee's device follows them: move it to the new department, REMOVE the old
@@ -750,7 +746,10 @@ router.delete("/:id", requireAuth, requireRole("OrganizationAdmin"), async (req,
     }
 
     // Clear any department that has this employee set as its manager first
-    await pool.query("UPDATE departments SET manager_employee_id = NULL WHERE manager_employee_id = $1", [id]);
+    await pool.query(
+      "UPDATE departments SET manager_id = NULL WHERE manager_id = (SELECT linked_user_id FROM employees WHERE id = $1)",
+      [id]
+    );
     await pool.query("DELETE FROM employees WHERE id = $1", [id]);
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_deleted", status: "success", req });

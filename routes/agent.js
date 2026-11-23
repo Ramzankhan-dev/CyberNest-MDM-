@@ -133,8 +133,7 @@ router.post("/provisioning/complete", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE devices SET device_owner_confirmed_at = NOW()
-       WHERE device_uid = $1 RETURNING organization_id`,
+      "SELECT organization_id FROM devices WHERE device_uid = $1",
       [device_uid]
     );
     if (result.rows.length === 0) {

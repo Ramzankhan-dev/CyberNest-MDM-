@@ -129,7 +129,7 @@ const ENTITIES = {
       name: ["Department", "dep.name"],
       code: ["Code", "dep.code"],
       status: ["Status", "dep.status"],
-      manager: ["Manager", "(SELECT m.name FROM employees m WHERE m.id = dep.manager_employee_id)"],
+      manager: ["Manager", "(SELECT m.name FROM employees m WHERE m.linked_user_id = dep.manager_id LIMIT 1)"],
       default_policy: ["Default policy", "p.name"],
       employees: ["Employees", "(SELECT COUNT(*) FROM employees x WHERE x.department_id = dep.id)::int"],
       devices: ["Devices", "(SELECT COUNT(DISTINCT dv2.id) FROM devices dv2 LEFT JOIN employees e2 ON e2.device_id = dv2.id WHERE COALESCE(dv2.department_id, e2.department_id) = dep.id)::int"],

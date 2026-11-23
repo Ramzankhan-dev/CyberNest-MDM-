@@ -15,7 +15,7 @@ function isValidCode(code) {
 // returns 403 before this handler ever runs for a Super Admin caller.
 router.post("/", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
-    const { name, code, manager_employee_id, description, default_policy_id, status } = req.body;
+    const { name, code, description, default_policy_id, status } = req.body;
     const orgId = req.user.organization_id;
 
     if (!name || name.trim().length < 3 || name.trim().length > 100) {
@@ -38,9 +38,9 @@ router.post("/", requireAuth, blockSuperAdmin, async (req, res) => {
     if (dupName.rows.length > 0) return res.status(409).json({ error: "Department name already exists" });
 
     const result = await pool.query(
-      `INSERT INTO departments (organization_id, name, code, manager_employee_id, description, default_policy_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [orgId, name.trim(), code, manager_employee_id || null, description || null, default_policy_id || null, status || "active"]
+      `INSERT INTO departments (organization_id, name, code, description, default_policy_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [orgId, name.trim(), code, description || null, default_policy_id || null, status || "active"]
     );
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "department_created", status: "success", req, details: name });
@@ -101,7 +101,7 @@ router.get("/", requireAuth, async (req, res) => {
               (SELECT COUNT(*) FROM devices dv WHERE dv.department_id = d.id${deviceExtra} AND dv.last_seen > NOW() - INTERVAL '90 seconds') AS online_count
        FROM departments d
        LEFT JOIN policies p ON d.default_policy_id = p.id
-       LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id
+       LEFT JOIN employees mgr ON mgr.linked_user_id = d.manager_id
        WHERE ${conditions.join(" AND ")}
        ORDER BY ${orderBy}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -109,7 +109,7 @@ router.get("/", requireAuth, async (req, res) => {
     );
 
     const countResult = await pool.query(
-      `SELECT COUNT(*) FROM departments d LEFT JOIN employees mgr ON d.manager_employee_id = mgr.id WHERE ${conditions.join(" AND ")}`,
+      `SELECT COUNT(*) FROM departments d LEFT JOIN employees mgr ON mgr.linked_user_id = d.manager_id WHERE ${conditions.join(" AND ")}`,
       params.slice(0, filterParamCount)
     );
 
@@ -162,40 +162,6 @@ router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   }
 });
 
-// PATCH /api/departments/:id/manager   (SRS-005 FR-06)
-router.patch("/:id/manager", requireAuth, blockSuperAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { manager_employee_id } = req.body;
-
-    const existing = await pool.query("SELECT * FROM departments WHERE id = $1", [id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Department not found" });
-    const dept = existing.rows[0];
-    if (dept.organization_id !== req.user.organization_id) {
-      return res.status(404).json({ error: "Department not found" });
-    }
-
-    if (manager_employee_id) {
-      const emp = await pool.query(
-        "SELECT e.id FROM employees e JOIN departments d ON e.department_id = d.id WHERE e.id = $1 AND d.organization_id = $2 AND e.status = 'active'",
-        [manager_employee_id, dept.organization_id]
-      );
-      if (emp.rows.length === 0) return res.status(400).json({ error: "Selected manager is invalid" });
-    }
-
-    const result = await pool.query(
-      "UPDATE departments SET manager_employee_id = $1 WHERE id = $2 RETURNING *",
-      [manager_employee_id || null, id]
-    );
-
-    await logAudit({ userId: req.user.id, organizationId: dept.organization_id, action: "department_manager_assigned", status: "success", req });
-    res.json({ message: "Manager assigned", department: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
 // DELETE /api/departments/:id   (SRS-005 BR-05)
 router.delete("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
   try {
@@ -227,7 +193,6 @@ router.delete("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
       await client.query("BEGIN");
       await client.query("DELETE FROM notifications WHERE target_department_id = $1", [id]);
       await client.query("UPDATE enrollment_profiles SET default_department_id = NULL WHERE default_department_id = $1", [id]);
-      await client.query("UPDATE organization_settings SET default_department_id = NULL WHERE default_department_id = $1", [id]);
       await client.query("DELETE FROM departments WHERE id = $1", [id]);
       await client.query("COMMIT");
     } catch (e) {

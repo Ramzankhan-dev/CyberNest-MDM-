@@ -18,8 +18,6 @@ const POLICY_FIELDS = [
   "airplane_mode_blocked", "location_services_blocked", "factory_reset_blocked",
   "password_required", "password_min_length", "max_failed_attempts", "auto_lock_timeout_minutes",
   "blocked_apps", "prevent_unknown_sources", "prevent_play_store",
-  "root_detection_enabled", "developer_options_disabled",
-  "vpn_required", "mobile_data_restricted",
   "kiosk_mode", "kiosk_package", "working_hours_start", "working_hours_end",
 ];
 

@@ -36,8 +36,7 @@ router.put("/", requireAuth, async (req, res) => {
 
     const {
       time_zone, date_format, max_failed_login_attempts, lockout_duration_minutes,
-      session_timeout_minutes, default_qr_expiry_hours, default_policy_id, default_department_id,
-      default_notification_priority,
+      session_timeout_minutes, default_qr_expiry_hours,
     } = req.body;
 
     // FR-02: basic validation on numeric ranges
@@ -55,13 +54,10 @@ router.put("/", requireAuth, async (req, res) => {
         lockout_duration_minutes = COALESCE($4, lockout_duration_minutes),
         session_timeout_minutes = COALESCE($5, session_timeout_minutes),
         default_qr_expiry_hours = COALESCE($6, default_qr_expiry_hours),
-        default_policy_id = $7, default_department_id = $8,
-        default_notification_priority = COALESCE($9, default_notification_priority),
         updated_at = NOW()
-       WHERE organization_id = $10 RETURNING *`,
+       WHERE organization_id = $7 RETURNING *`,
       [time_zone, date_format, max_failed_login_attempts, lockout_duration_minutes, session_timeout_minutes,
-       default_qr_expiry_hours, default_policy_id || null, default_department_id || null,
-       default_notification_priority, orgId]
+       default_qr_expiry_hours, orgId]
     );
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "settings_updated", status: "success", req, details: JSON.stringify(req.body) });

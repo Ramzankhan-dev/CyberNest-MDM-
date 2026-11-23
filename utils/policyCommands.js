@@ -16,7 +16,6 @@ const BOOLEAN_FLAGS = [
   "screenshot_blocked", "usb_debugging_blocked", "mobile_hotspot_blocked",
   "airplane_mode_blocked", "location_services_blocked", "factory_reset_blocked",
   "password_required", "prevent_unknown_sources", "prevent_play_store",
-  "vpn_required", "mobile_data_restricted", "developer_options_disabled",
   "kiosk_mode",
 ];
 
