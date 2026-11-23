@@ -6,6 +6,8 @@ const requireRole = require("../middleware/roles");
 const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
+const admin = require("../config/firebase");
+const { getDevicePolicies, isActive, mergePolicies, pushView, buildCommandsForPolicy, buildUnblockDiff } = require("../utils/policyCommands");
 const { passwordRuleError } = require("../utils/passwordRules");
 
 const router = express.Router();
@@ -163,7 +165,7 @@ router.get("/profile", requireEmployeeAuth, async (req, res) => {
 });
 
 async function getDepartmentAnyOrg(departmentId) {
-  const result = await pool.query("SELECT id, status, organization_id FROM departments WHERE id = $1", [departmentId]);
+  const result = await pool.query("SELECT id, status, organization_id, manager_id, manager_employee_id, default_policy_id FROM departments WHERE id = $1", [departmentId]);
   return result.rows[0] || null;
 }
 
@@ -493,6 +495,60 @@ router.patch("/:id/department", requireAuth, blockSuperAdmin, async (req, res) =
     const result = await pool.query("UPDATE employees SET department_id = $1 WHERE id = $2 RETURNING *", [department_id, id]);
     if (movingManager) {
       await pool.query("UPDATE departments SET manager_id = $1, manager_employee_id = $2 WHERE id = $3", [empRow.linked_user_id, id, department_id]);
+    }
+
+    // The employee's device follows them: move it to the new department, REMOVE the old
+    // department's default policy from it, and apply the new department's default policy
+    // (if it has an active one). Policy rows always update; the FCM push is best-effort.
+    const movedDeviceId = result.rows[0]?.device_id;
+    if (movedDeviceId && String(empRow.department_id) !== String(department_id)) {
+      await pool.query("UPDATE devices SET department_id = $1 WHERE id = $2", [department_id, movedDeviceId]);
+      try {
+        const oldDept = (await pool.query("SELECT default_policy_id FROM departments WHERE id = $1", [empRow.department_id])).rows[0];
+        const oldPolicyId = oldDept?.default_policy_id || null;
+        const newPolicy = dept.default_policy_id
+          ? (await pool.query("SELECT * FROM policies WHERE id = $1", [dept.default_policy_id])).rows[0]
+          : null;
+        const newActive = newPolicy && isActive(newPolicy) ? newPolicy : null;
+        const keepOld = oldPolicyId && newActive && String(oldPolicyId) === String(newActive.id);
+
+        const device = (await pool.query("SELECT * FROM devices WHERE id = $1", [movedDeviceId])).rows[0];
+        const before = await getDevicePolicies(pool, movedDeviceId);
+        const after = before.filter((p) => (!oldPolicyId || String(p.id) !== String(oldPolicyId) || keepOld) && (!newActive || String(p.id) !== String(newActive.id)));
+        if (newActive) after.push(newActive);
+
+        if (device.fcm_token) {
+          const unblock = buildUnblockDiff(mergePolicies(before), mergePolicies(after));
+          const reapply = buildCommandsForPolicy(pushView(mergePolicies(after)));
+          for (const cmd of [...unblock, ...reapply]) {
+            const log = await pool.query(
+              "INSERT INTO commands (device_id, command_type, issued_by, status) VALUES ($1, $2, $3, 'pending') RETURNING id",
+              [movedDeviceId, cmd.type, req.user.id]
+            );
+            await admin.messaging().send({ token: device.fcm_token, data: { command: cmd.type, command_id: String(log.rows[0].id), ...(cmd.extra || {}) } });
+            await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [log.rows[0].id]);
+          }
+        }
+      } catch (e) {
+        console.error("Department default policy push failed:", e.message);
+      }
+      // DB assignment follows the department regardless of whether the push succeeded.
+      try {
+        const oldDept2 = (await pool.query("SELECT default_policy_id FROM departments WHERE id = $1", [empRow.department_id])).rows[0];
+        const oldId = oldDept2?.default_policy_id;
+        if (oldId && String(oldId) !== String(dept.default_policy_id)) {
+          await pool.query("DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2", [movedDeviceId, oldId]);
+        }
+        if (dept.default_policy_id) {
+          const np = (await pool.query("SELECT status FROM policies WHERE id = $1", [dept.default_policy_id])).rows[0];
+          if (np && (np.status || "active") === "active") {
+            await pool.query("DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2", [movedDeviceId, dept.default_policy_id]);
+            await pool.query("INSERT INTO device_policies (device_id, policy_id) VALUES ($1, $2)", [movedDeviceId, dept.default_policy_id]);
+          }
+        }
+      } catch (e) {
+        console.error("Department default policy assignment failed:", e.message);
+      }
     }
 
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_department_changed", status: "success", req });
