@@ -36,7 +36,7 @@ router.put("/", requireAuth, async (req, res) => {
 
     const {
       time_zone, date_format, max_failed_login_attempts, lockout_duration_minutes,
-      session_timeout_days, default_qr_expiry_hours, default_policy_id, default_department_id,
+      session_timeout_minutes, default_qr_expiry_hours, default_policy_id, default_department_id,
       default_notification_priority,
     } = req.body;
 
@@ -44,8 +44,8 @@ router.put("/", requireAuth, async (req, res) => {
     if (max_failed_login_attempts !== undefined && (max_failed_login_attempts < 3 || max_failed_login_attempts > 10)) {
       return res.status(400).json({ error: "Configuration value is invalid — max failed attempts must be 3-10" });
     }
-    if (session_timeout_days !== undefined && (session_timeout_days < 1 || session_timeout_days > 30)) {
-      return res.status(400).json({ error: "Configuration value is invalid — session timeout must be 1-30 days" });
+    if (session_timeout_minutes !== undefined && (!Number.isInteger(session_timeout_minutes) || session_timeout_minutes < 5 || session_timeout_minutes > 43200)) {
+      return res.status(400).json({ error: "Configuration value is invalid — session timeout must be between 5 minutes and 30 days" });
     }
 
     const result = await pool.query(
@@ -53,13 +53,13 @@ router.put("/", requireAuth, async (req, res) => {
         time_zone = COALESCE($1, time_zone), date_format = COALESCE($2, date_format),
         max_failed_login_attempts = COALESCE($3, max_failed_login_attempts),
         lockout_duration_minutes = COALESCE($4, lockout_duration_minutes),
-        session_timeout_days = COALESCE($5, session_timeout_days),
+        session_timeout_minutes = COALESCE($5, session_timeout_minutes),
         default_qr_expiry_hours = COALESCE($6, default_qr_expiry_hours),
         default_policy_id = $7, default_department_id = $8,
         default_notification_priority = COALESCE($9, default_notification_priority),
         updated_at = NOW()
        WHERE organization_id = $10 RETURNING *`,
-      [time_zone, date_format, max_failed_login_attempts, lockout_duration_minutes, session_timeout_days,
+      [time_zone, date_format, max_failed_login_attempts, lockout_duration_minutes, session_timeout_minutes,
        default_qr_expiry_hours, default_policy_id || null, default_department_id || null,
        default_notification_priority, orgId]
     );

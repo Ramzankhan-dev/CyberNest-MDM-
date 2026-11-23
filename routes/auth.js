@@ -135,7 +135,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     // SRS-017: Security settings (lockout threshold/duration, session
     // length) are per-organization configurable — fall back to sane
     // defaults if the org hasn't set any yet.
-    let orgSettings = { max_failed_login_attempts: MAX_FAILED_ATTEMPTS, lockout_duration_minutes: LOCK_DURATION_MINUTES, session_timeout_days: 7 };
+    let orgSettings = { max_failed_login_attempts: MAX_FAILED_ATTEMPTS, lockout_duration_minutes: LOCK_DURATION_MINUTES, session_timeout_minutes: 1440 };
     if (user.organization_id) {
       const settingsResult = await pool.query("SELECT * FROM organization_settings WHERE organization_id = $1", [user.organization_id]);
       if (settingsResult.rows[0]) orgSettings = settingsResult.rows[0];
@@ -157,7 +157,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role_name || user.role, organization_id: user.organization_id, is_super_admin: !!user.is_super_admin },
       process.env.JWT_SECRET,
-      { expiresIn: `${orgSettings.session_timeout_days || 7}d` }
+      { expiresIn: `${orgSettings.session_timeout_minutes || 1440}m` }
     );
 
     const refreshToken = crypto.randomBytes(40).toString("hex");
