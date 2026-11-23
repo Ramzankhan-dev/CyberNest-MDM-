@@ -236,7 +236,6 @@ router.get("/stats", requireAuth, async (req, res) => {
       scheduled: parseInt(scheduled.rows[0].count),
       delivered: parseInt(delivered.rows[0].count),
       failed: parseInt(failed.rows[0].count),
-      acknowledged: 0, // not implemented — see PROGRESS notes: needs Android-side interactive UI
     });
   } catch (err) {
     console.error(err);
