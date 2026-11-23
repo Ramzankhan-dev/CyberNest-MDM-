@@ -18,6 +18,7 @@ const auditLogRoutes = require("./routes/auditLogs");
 const settingsRoutes = require("./routes/settings");
 const agentRoutes = require("./routes/agent");
 const reportRoutes = require("./routes/reports");
+const managerReportRoutes = require("./routes/managerReports");
 
 const app = express();
 
@@ -50,6 +51,7 @@ app.use("/api/audit-logs", auditLogRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/agent", agentRoutes);
 app.use("/api/reports", reportRoutes);
+app.use("/api/manager-reports", managerReportRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
