@@ -94,6 +94,27 @@ router.get("/summary", requireAuth, async (req, res) => {
       };
     }
 
+    // Department Manager extras: their department's name, employee count and free (unassigned) devices.
+    let managerExtra = {};
+    if (roleName === "DepartmentManager") {
+      const managedDeptId = deviceParams[1];
+      const deptRow = await pool.query("SELECT name FROM departments WHERE id = $1", [managedDeptId]);
+      const empCount = await pool.query(
+        "SELECT COUNT(*) FROM employees WHERE department_id = $1 AND role <> 'DepartmentManager'",
+        [managedDeptId]
+      );
+      const unassigned = await pool.query(
+        `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+          WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) IS NULL`,
+        [req.user.organization_id]
+      );
+      managerExtra = {
+        department_name: deptRow.rows[0]?.name || null,
+        total_employees: parseInt(empCount.rows[0].count),
+        unassigned_devices: parseInt(unassigned.rows[0].count),
+      };
+    }
+
     res.json({
       total_organizations: totalOrganizations,
       total_devices: totalDevicesCount,
@@ -104,6 +125,7 @@ router.get("/summary", requireAuth, async (req, res) => {
       pending_commands: parseInt(pendingCommands.rows[0].count),
       todays_alerts: parseInt(todaysAlerts.rows[0].count),
       ...platform,
+      ...managerExtra,
     });
 
     await logAudit({ userId: req.user.id, organizationId: req.user.organization_id, action: "dashboard_accessed", status: "success", req });
