@@ -115,6 +115,25 @@ router.get("/summary", requireAuth, async (req, res) => {
       };
     }
 
+    // Organization Admin extras: department / employee counts and devices not in any department.
+    if (roleName === "OrganizationAdmin") {
+      const depts = await pool.query("SELECT COUNT(*) FROM departments WHERE organization_id = $1", [req.user.organization_id]);
+      const emps = await pool.query(
+        "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1",
+        [req.user.organization_id]
+      );
+      const unassigned = await pool.query(
+        `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+          WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) IS NULL`,
+        [req.user.organization_id]
+      );
+      managerExtra = {
+        total_departments: parseInt(depts.rows[0].count),
+        total_employees: parseInt(emps.rows[0].count),
+        unassigned_devices: parseInt(unassigned.rows[0].count),
+      };
+    }
+
     res.json({
       total_organizations: totalOrganizations,
       total_devices: totalDevicesCount,
