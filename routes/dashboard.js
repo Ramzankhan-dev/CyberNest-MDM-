@@ -61,10 +61,16 @@ router.get("/summary", requireAuth, async (req, res) => {
        WHERE ${deviceWhere} AND dv.is_rooted = TRUE`,
       deviceParams
     );
+    // Counts alerts the same way the Security Alerts list does: one per issue
+    // (rooted / battery under 15% / offline), so a device with two issues counts twice.
     const todaysAlerts = await pool.query(
-      `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
-       WHERE ${deviceWhere} AND
-       (dv.is_rooted = TRUE OR (dv.battery_level IS NOT NULL AND dv.battery_level < 15) OR dv.last_seen < NOW() - INTERVAL '90 seconds')`,
+      `SELECT COALESCE(SUM(
+         (COALESCE(dv.is_rooted, FALSE))::int
+         + (dv.battery_level IS NOT NULL AND dv.battery_level < 15)::int
+         + (dv.last_seen IS NOT NULL AND dv.last_seen < NOW() - INTERVAL '90 seconds')::int
+       ), 0) AS count
+       FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
+       WHERE ${deviceWhere}`,
       deviceParams
     );
 
@@ -94,7 +100,7 @@ router.get("/summary", requireAuth, async (req, res) => {
       };
     }
 
-    // Department Manager extras: their department's name, employee count and free (unassigned) devices.
+    // Department Manager extras: their department's name, and employee count.
     let managerExtra = {};
     if (roleName === "DepartmentManager") {
       const managedDeptId = deviceParams[1];
@@ -103,15 +109,9 @@ router.get("/summary", requireAuth, async (req, res) => {
         "SELECT COUNT(*) FROM employees WHERE department_id = $1 AND role <> 'DepartmentManager'",
         [managedDeptId]
       );
-      const unassigned = await pool.query(
-        `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
-          WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) IS NULL`,
-        [req.user.organization_id]
-      );
       managerExtra = {
         department_name: deptRow.rows[0]?.name || null,
         total_employees: parseInt(empCount.rows[0].count),
-        unassigned_devices: parseInt(unassigned.rows[0].count),
       };
     }
 
@@ -122,15 +122,9 @@ router.get("/summary", requireAuth, async (req, res) => {
         "SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.organization_id = $1",
         [req.user.organization_id]
       );
-      const unassigned = await pool.query(
-        `SELECT COUNT(*) FROM devices dv LEFT JOIN employees e ON e.device_id = dv.id
-          WHERE dv.organization_id = $1 AND COALESCE(dv.department_id, e.department_id) IS NULL`,
-        [req.user.organization_id]
-      );
       managerExtra = {
         total_departments: parseInt(depts.rows[0].count),
         total_employees: parseInt(emps.rows[0].count),
-        unassigned_devices: parseInt(unassigned.rows[0].count),
       };
     }
 
