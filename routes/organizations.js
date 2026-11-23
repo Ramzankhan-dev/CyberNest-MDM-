@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const requireAuth = require("../middleware/auth");
 const requireSuperAdmin = require("../middleware/superAdmin");
 const logAudit = require("../utils/auditLog");
+const { isEmailVerified, consumeVerification, NOT_VERIFIED_MESSAGE } = require("../utils/emailVerification");
 
 const router = express.Router();
 
@@ -116,6 +117,9 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
     const dupCode = await pool.query("SELECT id FROM organizations WHERE code = $1", [code]);
     if (dupCode.rows.length > 0) return res.status(409).json({ error: "Organization code already exists" });
 
+    // The email must be proven to exist (OTP sent to it and entered back)
+    if (!(await isEmailVerified(email, req.user.id))) return res.status(400).json({ error: NOT_VERIFIED_MESSAGE });
+
     const orgResult = await pool.query(
       `INSERT INTO organizations (name, code, industry, email, contact_number, country, city, address, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
@@ -135,6 +139,7 @@ router.post("/", requireAuth, requireSuperAdmin, async (req, res) => {
       );
     }
 
+    await consumeVerification(email, req.user.id);
     await logAudit({ userId: req.user.id, organizationId: org.id, action: "organization_created", status: "success", req, details: org.name });
 
     res.status(201).json({ message: "Organization created", organization: org });

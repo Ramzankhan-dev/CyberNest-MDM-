@@ -6,6 +6,7 @@ const requireRole = require("../middleware/roles");
 const { getManagedDepartmentId, blockSuperAdmin } = require("../middleware/roles");
 const requireEmployeeAuth = require("../middleware/employeeAuth");
 const logAudit = require("../utils/auditLog");
+const { isEmailVerified, consumeVerification, NOT_VERIFIED_MESSAGE } = require("../utils/emailVerification");
 const admin = require("../config/firebase");
 const { getDevicePolicies, isActive, mergePolicies, pushView, buildCommandsForPolicy, buildUnblockDiff } = require("../utils/policyCommands");
 const { passwordRuleError } = require("../utils/passwordRules");
@@ -248,6 +249,9 @@ router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res)
     );
     if (dupEmail.rows.length > 0) return res.status(409).json({ error: "Email already exists" });
 
+    // The email must be proven to exist (OTP sent to it and entered back)
+    if (!(await isEmailVerified(email, req.user.id))) return res.status(400).json({ error: NOT_VERIFIED_MESSAGE });
+
     const fullName = `${first_name} ${last_name}`.trim();
     const result = await pool.query(
       `INSERT INTO employees (department_id, name, employee_code, email, phone_number, designation, role, status)
@@ -276,6 +280,7 @@ router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res)
       }
     }
 
+    await consumeVerification(email, req.user.id);
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "employee_created", status: "success", req, details: fullName });
     res.status(201).json({ message: "Employee added", employee: result.rows[0] });
   } catch (err) {
@@ -399,6 +404,11 @@ router.put("/:id", requireAuth, requireRole("OrganizationAdmin"), blockSuperAdmi
       );
       if (dupUser.rows.length > 0) return res.status(409).json({ error: "This email is already used by another account" });
     }
+    // A changed email must be proven to exist (OTP sent to it and entered back)
+    const emailChanged = email !== null && email.toLowerCase() !== String(current.email || "").toLowerCase();
+    if (emailChanged && !(await isEmailVerified(email, req.user.id))) {
+      return res.status(400).json({ error: NOT_VERIFIED_MESSAGE });
+    }
 
     let phone;
     if (has("phone_number")) {
@@ -451,6 +461,7 @@ router.put("/:id", requireAuth, requireRole("OrganizationAdmin"), blockSuperAdmi
       client.release();
     }
 
+    if (emailChanged) await consumeVerification(email, req.user.id);
     await logAudit({ userId: req.user.id, organizationId: empOrgId, action: "employee_updated", status: "success", req, details: `employee #${id}${passwordHash ? " (password changed)" : ""}` });
     res.json({ message: "Employee updated", employee: { ...updated, password_hash: undefined } });
   } catch (err) {

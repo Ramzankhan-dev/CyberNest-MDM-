@@ -19,6 +19,7 @@ const settingsRoutes = require("./routes/settings");
 const agentRoutes = require("./routes/agent");
 const reportRoutes = require("./routes/reports");
 const managerReportRoutes = require("./routes/managerReports");
+const emailVerificationRoutes = require("./routes/emailVerification");
 
 const app = express();
 
@@ -52,6 +53,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/agent", agentRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/manager-reports", managerReportRoutes);
+app.use("/api/email-verification", emailVerificationRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {

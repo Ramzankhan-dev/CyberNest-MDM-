@@ -34,4 +34,32 @@ async function sendOtpEmail(toEmail, otp) {
   }
 }
 
-module.exports = { sendOtpEmail };
+// Email verification code (Organization / Org Admin / Manager / Employee
+// email). Uses its own EmailJS template so the email doesn't talk about a
+// password reset. Template variables: {{to_email}} and {{otp}}.
+async function sendVerificationEmail(toEmail, otp) {
+  const templateId = process.env.EMAILJS_VERIFY_TEMPLATE_ID;
+  if (!templateId) throw new Error("EMAILJS_VERIFY_TEMPLATE_ID is not set");
+
+  const response = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      service_id: process.env.EMAILJS_SERVICE_ID,
+      template_id: templateId,
+      user_id: process.env.EMAILJS_PUBLIC_KEY,
+      accessToken: process.env.EMAILJS_PRIVATE_KEY,
+      template_params: {
+        to_email: toEmail,
+        otp: otp,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`EmailJS send failed: ${response.status} ${errorBody}`);
+  }
+}
+
+module.exports = { sendOtpEmail, sendVerificationEmail };
