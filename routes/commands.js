@@ -19,6 +19,8 @@ async function dispatchCommand(device, commandType, issuedBy, packageName, req) 
   try {
     const messageData = { command: commandType, command_id: String(commandLog.rows[0].id) };
     if (packageName) messageData.package_name = packageName;
+    // Ring: the device shows "Ring from CyberNest Admin/Manager" with the ring
+    if (commandType === "ring") messageData.sent_by = req.user?.role === "DepartmentManager" ? "Manager" : "Admin";
 
     await admin.messaging().send({ token: device.fcm_token, data: messageData });
 
