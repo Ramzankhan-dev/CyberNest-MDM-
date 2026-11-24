@@ -517,12 +517,24 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Selected device does not exist" });
 
-    // Reverse every policy assigned to this device (not just the latest one).
+    // ?policy_id=<id> removes ONLY that policy (the rest stay assigned and enforced);
+    // without it every policy on the device is reversed and removed.
     const allPolicies = await getDevicePolicies(pool, device.id);
-    const policy = allPolicies[allPolicies.length - 1];
+    const targetId = req.query.policy_id ? String(req.query.policy_id) : null;
+    let removed = allPolicies;
+    let remaining = [];
+    if (targetId) {
+      removed = allPolicies.filter((p) => String(p.id) === targetId);
+      if (removed.length === 0) return res.status(409).json({ error: "That policy is not assigned to this device" });
+      remaining = allPolicies.filter((p) => String(p.id) !== targetId);
+    }
 
-    if (policy && device.fcm_token) {
-      const commands = buildUnblockDiff(mergePolicies(allPolicies), null);
+    if (removed.length > 0 && device.fcm_token) {
+      // Undo only what no remaining policy still needs, then re-assert what the remaining ones require.
+      const commands = [
+        ...buildUnblockDiff(mergePolicies(allPolicies), mergePolicies(remaining)),
+        ...(remaining.length > 0 ? buildCommandsForPolicy(pushView(mergePolicies(remaining))) : []),
+      ];
 
       for (const cmd of commands) {
         const cmdLog = await pool.query(
@@ -538,10 +550,14 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
       }
     }
 
-    await pool.query("DELETE FROM device_policies WHERE device_id = $1", [device.id]);
+    if (targetId) {
+      await pool.query("DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2", [device.id, targetId]);
+    } else {
+      await pool.query("DELETE FROM device_policies WHERE device_id = $1", [device.id]);
+    }
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_policy_unassigned", status: "success", req, details: device_uid });
-    res.json({ message: policy ? `Policy "${allPolicies.map((p) => p.name).join(", ")}" reversed and unassigned` : "No policy was assigned to this device" });
+    res.json({ message: removed.length > 0 ? `Policy "${removed.map((p) => p.name).join(", ")}" reversed and unassigned` : "No policy was assigned to this device" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
