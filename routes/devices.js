@@ -411,11 +411,14 @@ router.post("/:device_uid/apps", async (req, res) => {
 
     for (const app of apps) {
       await pool.query(
-        `INSERT INTO device_apps (device_id, package_name, app_name)
-         VALUES ($1, $2, $3)
+        `INSERT INTO device_apps (device_id, package_name, app_name, status)
+         VALUES ($1, $2, $3, COALESCE($4, 'allowed'))
          ON CONFLICT (device_id, package_name)
-         DO UPDATE SET app_name = EXCLUDED.app_name, updated_at = NOW()`,
-        [device.id, app.package_name, app.app_name || null]
+         DO UPDATE SET app_name = EXCLUDED.app_name,
+                       status = COALESCE($4, device_apps.status),
+                       updated_at = NOW()`,
+        [device.id, app.package_name, app.app_name || null,
+         typeof app.blocked === "boolean" ? (app.blocked ? "blocked" : "allowed") : null]
       );
     }
 
@@ -425,7 +428,7 @@ router.post("/:device_uid/apps", async (req, res) => {
     const currentPackageNames = apps.map((a) => a.package_name);
     if (currentPackageNames.length > 0) {
       await pool.query(
-        `DELETE FROM device_apps WHERE device_id = $1 AND package_name != ALL($2::text[])`,
+        `DELETE FROM device_apps WHERE device_id = $1 AND package_name != ALL($2::text[]) AND status IS DISTINCT FROM 'blocked'`,
         [device.id, currentPackageNames]
       );
     }
@@ -517,24 +520,12 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
     const device = deviceResult.rows[0];
     if (!device) return res.status(404).json({ error: "Selected device does not exist" });
 
-    // ?policy_id=<id> removes ONLY that policy (the rest stay assigned and enforced);
-    // without it every policy on the device is reversed and removed.
+    // Reverse every policy assigned to this device (not just the latest one).
     const allPolicies = await getDevicePolicies(pool, device.id);
-    const targetId = req.query.policy_id ? String(req.query.policy_id) : null;
-    let removed = allPolicies;
-    let remaining = [];
-    if (targetId) {
-      removed = allPolicies.filter((p) => String(p.id) === targetId);
-      if (removed.length === 0) return res.status(409).json({ error: "That policy is not assigned to this device" });
-      remaining = allPolicies.filter((p) => String(p.id) !== targetId);
-    }
+    const policy = allPolicies[allPolicies.length - 1];
 
-    if (removed.length > 0 && device.fcm_token) {
-      // Undo only what no remaining policy still needs, then re-assert what the remaining ones require.
-      const commands = [
-        ...buildUnblockDiff(mergePolicies(allPolicies), mergePolicies(remaining)),
-        ...(remaining.length > 0 ? buildCommandsForPolicy(pushView(mergePolicies(remaining))) : []),
-      ];
+    if (policy && device.fcm_token) {
+      const commands = buildUnblockDiff(mergePolicies(allPolicies), null);
 
       for (const cmd of commands) {
         const cmdLog = await pool.query(
@@ -550,14 +541,10 @@ router.delete("/:device_uid/policy", requireAuth, blockSuperAdmin, async (req, r
       }
     }
 
-    if (targetId) {
-      await pool.query("DELETE FROM device_policies WHERE device_id = $1 AND policy_id = $2", [device.id, targetId]);
-    } else {
-      await pool.query("DELETE FROM device_policies WHERE device_id = $1", [device.id]);
-    }
+    await pool.query("DELETE FROM device_policies WHERE device_id = $1", [device.id]);
 
     await logAudit({ userId: req.user.id, organizationId: orgId, action: "device_policy_unassigned", status: "success", req, details: device_uid });
-    res.json({ message: removed.length > 0 ? `Policy "${removed.map((p) => p.name).join(", ")}" reversed and unassigned` : "No policy was assigned to this device" });
+    res.json({ message: policy ? `Policy "${allPolicies.map((p) => p.name).join(", ")}" reversed and unassigned` : "No policy was assigned to this device" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
