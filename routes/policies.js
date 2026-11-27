@@ -18,26 +18,8 @@ const POLICY_FIELDS = [
   "airplane_mode_blocked", "location_services_blocked", "factory_reset_blocked",
   "password_required", "password_min_length", "max_failed_attempts", "auto_lock_timeout_minutes",
   "blocked_apps", "prevent_unknown_sources", "prevent_play_store",
-  "root_detection_enabled", "developer_options_disabled",
-  "vpn_required", "mobile_data_restricted",
   "kiosk_mode", "kiosk_package", "working_hours_start", "working_hours_end",
 ];
-
-// Password-policy numbers: empty = not set; otherwise whole numbers inside a sane range (no negatives).
-const PASSWORD_LIMITS = [
-  ["password_min_length", "Minimum password length", 4, 16],
-  ["max_failed_attempts", "Max failed attempts", 1, 20],
-  ["auto_lock_timeout_minutes", "Auto-lock minutes", 1, 1440],
-];
-function passwordNumberError(body) {
-  for (const [field, label, min, max] of PASSWORD_LIMITS) {
-    const v = body[field];
-    if (v === undefined || v === null || v === "") continue;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n < min || n > max) return `${label} must be a whole number between ${min} and ${max}`;
-  }
-  return null;
-}
 
 function isValidCode(code) {
   return /^[A-Z0-9]{2,20}$/.test(code);
@@ -64,8 +46,6 @@ router.post("/", requireAuth, requireRole("OrganizationAdmin"), async (req, res)
     if (!policy_code || !isValidCode(policy_code)) {
       return res.status(400).json({ error: "Policy code must be 2-20 uppercase letters/numbers" });
     }
-    const pwError = passwordNumberError(req.body);
-    if (pwError) return res.status(400).json({ error: pwError });
 
     // BR-02: policy names unique within an organization
     const dupName = await pool.query(
@@ -171,9 +151,6 @@ router.put("/:id", requireAuth, blockSuperAdmin, async (req, res) => {
     if (policy.organization_id !== req.user.organization_id) {
       return res.status(404).json({ error: "Policy not found" });
     }
-
-    const pwError = passwordNumberError(req.body);
-    if (pwError) return res.status(400).json({ error: pwError });
 
     const { name, description } = req.body;
     if (name) {
@@ -397,7 +374,7 @@ router.post("/:id/assign", requireAuth, requireRole("OrganizationAdmin", "Depart
     if (!isActive(policy)) return res.status(400).json({ error: "This policy is disabled. Enable it before assigning." });
 
     const deviceResult = await pool.query(
-      `SELECT dv.*, e.department_id AS employee_department_id, e.role AS employee_role FROM devices dv
+      `SELECT dv.*, COALESCE(dv.department_id, e.department_id) AS employee_department_id, e.role AS employee_role FROM devices dv
        LEFT JOIN employees e ON e.device_id = dv.id
        WHERE dv.device_uid = $1 AND dv.organization_id = $2`,
       [device_uid, policy.organization_id]
